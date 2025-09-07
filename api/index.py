@@ -7,6 +7,7 @@ import requests
 import re
 import threading
 import math
+import asyncio
 from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
@@ -14,7 +15,10 @@ from functools import wraps
 from urllib.parse import unquote, quote
 from datetime import datetime, time
 from dotenv import load_dotenv
+
+# --- Telegram Imports ---
 from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
+from pyrogram import Client
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,24 +32,24 @@ WEBSITE_NAME = os.environ.get("WEBSITE_NAME", "MovieSite")
 WEBSITE_URL = os.environ.get("WEBSITE_URL", "http://127.0.0.1:5000")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID")
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
 
 # --- Validate Environment Variables ---
-if not all([MONGO_URI, TMDB_API_KEY]):
-    print("FATAL: MONGO_URI and TMDB_API_KEY must be set.")
+if not all([MONGO_URI, TMDB_API_KEY, API_ID, API_HASH, BOT_TOKEN]):
+    print("FATAL: One or more required environment variables are missing.")
     sys.exit(1)
-if BOT_TOKEN and TARGET_CHANNEL_ID:
-    try:
-        TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID)
-    except (ValueError, TypeError):
-        print("WARNING: TARGET_CHANNEL_ID is invalid. Bot will not start.")
-        BOT_TOKEN = None
-else:
-    print("INFO: Telegram bot auto-posting is disabled (BOT_TOKEN or TARGET_CHANNEL_ID not set).")
+try:
+    TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID)
+except (ValueError, TypeError):
+    print("WARNING: TARGET_CHANNEL_ID is invalid. Bot will not start.")
+    BOT_TOKEN = None
 
-# --- App Initialization ---
+# --- App Initialization & Pyrogram Client ---
 PLACEHOLDER_POSTER = "https://via.placeholder.com/400x600.png?text=Poster+Not+Found"
 ITEMS_PER_PAGE = 20
 app = Flask(__name__)
+pyro_bot = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- Authentication ---
 def check_auth(username, password):
@@ -66,30 +70,22 @@ def requires_auth(f):
 # --- Database Connection ---
 try:
     client = MongoClient(MONGO_URI)
-    db = client.get_default_database() if "retryWrites" in MONGO_URI else client["movie_db"]
+    db_name = MongoClient(MONGO_URI).get_default_database().name
+    db = client[db_name]
     movies = db["movies"]
     settings = db["settings"]
     categories_collection = db["categories"]
     requests_collection = db["requests"]
-    print("SUCCESS: Connected to MongoDB!")
+    print(f"SUCCESS: Connected to MongoDB! Using database: {db_name}")
 
     if categories_collection.count_documents({}) == 0:
         default_categories = ["Coming Soon", "Bengali", "Hindi", "English", "18+ Adult Zone", "Trending"]
         categories_collection.insert_many([{"name": cat} for cat in default_categories])
         print("SUCCESS: Initialized default categories.")
-
-    for collection in [movies, categories_collection, requests_collection]:
-        try:
-            if collection == movies:
-                collection.create_index("title")
-                collection.create_index("type")
-                collection.create_index("categories")
-            elif collection == categories_collection:
-                collection.create_index("name", unique=True)
-            elif collection == requests_collection:
-                collection.create_index("status")
-        except Exception as e:
-            print(f"WARNING: Index creation failed for {collection.name}: {e}")
+        
+    movies.create_index("title")
+    movies.create_index("type")
+    categories_collection.create_index("name", unique=True)
     print("SUCCESS: MongoDB indexes checked/created.")
 
 except Exception as e:
@@ -97,7 +93,7 @@ except Exception as e:
     sys.exit(1)
 
 # =========================================================================================
-# === [START] TELEGRAM BOT AUTOMATION LOGIC =============================================
+# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC ======================================
 # =========================================================================================
 def parse_filename(filename):
     match = re.search(r'^(.*?)\s*\((\d{4})\)', filename)
@@ -113,124 +109,113 @@ def search_tmdb_for_bot(title, year):
         response = requests.get(search_url, timeout=10)
         response.raise_for_status()
         results = response.json().get('results', [])
-        if not results: return None
-        
-        first_result = results[0]
-        media_type = first_result.get('media_type')
-        tmdb_id = first_result.get('id')
-        if not media_type or not tmdb_id or media_type not in ['movie', 'tv']: return None
-
+        first_result = next((r for r in results if r.get('media_type') in ['movie', 'tv']), None)
+        if not first_result: return None
+        media_type, tmdb_id = first_result['media_type'], first_result['id']
         detail_url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
-        detail_response = requests.get(detail_url, timeout=10)
-        detail_response.raise_for_status()
-        data = detail_response.json()
-        
+        data = requests.get(detail_url, timeout=10).json()
         return {
             "title": data.get("title") or data.get("name"),
             "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
             "backdrop": f"https://image.tmdb.org/t/p/w1280{data.get('backdrop_path')}" if data.get('backdrop_path') else None,
-            "overview": data.get("overview"),
-            "release_date": data.get("release_date") or data.get("first_air_date"),
-            "genres": [g['name'] for g in data.get("genres", [])],
-            "vote_average": data.get("vote_average"),
+            "overview": data.get("overview"), "release_date": data.get("release_date") or data.get("first_air_date"),
+            "genres": [g['name'] for g in data.get("genres", [])], "vote_average": data.get("vote_average"),
             "type": "series" if media_type == "tv" else "movie"
         }
-    except requests.RequestException as e:
+    except Exception as e:
         print(f"BOT ERROR: TMDB API request failed: {e}")
         return None
 
-def handle_new_post(update: object, context: CallbackContext):
+def handle_new_post(update, context):
     message = update.channel_post
     if message.chat_id != TARGET_CHANNEL_ID: return
-
     file = message.video or message.document
     if not file or not file.file_name: return
-        
-    print(f"BOT INFO: Received file: {file.file_name}")
+    
     title, year = parse_filename(file.file_name)
     if not title:
-        message.reply_text(f"⚠️ **Error:** Filename `{file.file_name}` is not in the correct format.\nRequired format: `Movie Name (Year).mkv`", parse_mode='Markdown')
+        message.reply_text("⚠️ **Error:** Filename format is incorrect. Use `Movie Name (Year).mkv`", parse_mode='Markdown')
         return
-
     tmdb_details = search_tmdb_for_bot(title, year)
     if not tmdb_details:
         message.reply_text(f"⚠️ **Error:** Could not find `{title} ({year})` on TMDB.", parse_mode='Markdown')
         return
-        
-    try:
-        tg_file = context.bot.get_file(file.file_id)
-        direct_download_link = tg_file.file_path
-        player_link = f"https://player.infuse.workers.dev/?link={direct_download_link}"
-    except Exception as e:
-        print(f"BOT ERROR: Failed to generate Telegram links: {e}")
-        message.reply_text(f"⚠️ **Error:** Could not generate Telegram links.")
-        return
-
+    
     movie_data = {
         "title": tmdb_details["title"], "type": tmdb_details["type"], "poster": tmdb_details["poster"] or PLACEHOLDER_POSTER,
-        "backdrop": tmdb_details["backdrop"], "overview": tmdb_details["overview"], "language": None,
-        "genres": tmdb_details["genres"], "categories": [], "release_date": tmdb_details["release_date"],
-        "vote_average": tmdb_details["vote_average"], "created_at": datetime.utcnow(),
-        "links": [], "episodes": [], "season_packs": [],
-        "manual_links": [
-            {"name": "Watch Online", "url": player_link},
-            {"name": "Download Now", "url": direct_download_link}
-        ]
+        "backdrop": tmdb_details["backdrop"], "overview": tmdb_details["overview"], "release_date": tmdb_details["release_date"],
+        "genres": tmdb_details["genres"], "vote_average": tmdb_details["vote_average"], "created_at": datetime.utcnow(),
+        "telegram_ref": {"chat_id": message.chat_id, "message_id": message.message_id}
     }
     
     try:
         result = movies.insert_one(movie_data)
-        new_movie_id = result.inserted_id
-        print(f"BOT SUCCESS: Added '{tmdb_details['title']}' to database.")
-        
-        post_url = f"{WEBSITE_URL}/movie/{new_movie_id}"
-        reply_message = f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added to the website.\n\n🔗 **View Post:** {post_url}"
-        message.reply_text(reply_message)
+        post_url = f"{WEBSITE_URL}/movie/{result.inserted_id}"
+        message.reply_text(f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", disable_web_page_preview=True)
     except Exception as e:
-        print(f"BOT ERROR: Failed to insert document into MongoDB: {e}")
         message.reply_text(f"⚠️ **Error:** Could not post to database. Details: {e}")
 
+async def generate_fresh_link_async(chat_id, msg_id):
+    """Generates a fresh, temporary download link from Telegram."""
+    if not pyro_bot.is_connected:
+        await pyro_bot.start()
+    try:
+        # A robust way to get a downloadable message is to forward it.
+        # Forwarding to "me" (Saved Messages) is a safe bet.
+        forwarded_message = await pyro_bot.forward_messages(
+            chat_id="me",
+            from_chat_id=chat_id,
+            message_ids=msg_id
+        )
+        # Now, get the download link from the forwarded message
+        # The download() method with in_memory=True is a trick to get the URL without saving the file
+        link = await forwarded_message.download(in_memory=True)
+        # Clean up by deleting the forwarded message from "Saved Messages"
+        await forwarded_message.delete()
+        return link
+    except Exception as e:
+        print(f"LINKGEN ERROR for {chat_id}/{msg_id}: {e}")
+        return None
+
 def start_telegram_bot():
-    if BOT_TOKEN and TARGET_CHANNEL_ID:
-        updater = Updater(BOT_TOKEN)
+    if BOT_TOKEN:
+        updater = Updater(BOT_TOKEN, use_context=True)
         dispatcher = updater.dispatcher
         dispatcher.add_handler(MessageHandler(Filters.update.channel_posts & (Filters.video | Filters.document), handle_new_post, run_async=True))
         
-        thread = threading.Thread(target=updater.start_polling)
-        thread.daemon = True
-        thread.start()
-        print("SUCCESS: Telegram bot is running in a separate thread.")
+        # Run polling and pyrogram client in separate threads
+        threading.Thread(target=updater.start_polling, daemon=True).start()
+        threading.Thread(target=pyro_bot.run, daemon=True).start()
+        print("SUCCESS: Telegram bot (poller & link generator) is running.")
 
-# =========================================================================================
-# === [START] JINJA FILTERS & CONTEXT PROCESSORS ==========================================
-# =========================================================================================
+# --- Custom Jinja Filter for Relative Time ---
 def time_ago(obj_id):
     if not isinstance(obj_id, ObjectId): return ""
     post_time = obj_id.generation_time.replace(tzinfo=None)
-    diff = datetime.utcnow() - post_time
-    s = diff.total_seconds()
-    if s < 60: return "just now"
-    if s < 3600: return f"{int(s/60)} minute{'s' if s/60 >= 2 else ''} ago"
-    if s < 86400: return f"{int(s/3600)} hour{'s' if s/3600 >= 2 else ''} ago"
-    return f"{int(s/86400)} day{'s' if s/86400 >= 2 else ''} ago"
-
+    now = datetime.utcnow()
+    diff = now - post_time
+    seconds = diff.total_seconds()
+    if seconds < 60: return "just now"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        return f"{hours} hour{'s' if hours > 1 else ''} ago"
+    else:
+        days = int(seconds / 86400)
+        return f"{days} day{'s' if days > 1 else ''} ago"
 app.jinja_env.filters['time_ago'] = time_ago
 
 @app.context_processor
 def inject_globals():
     ad_settings = settings.find_one({"_id": "ad_config"})
     all_categories = [cat['name'] for cat in categories_collection.find().sort("name", 1)]
-    return dict(
-        website_name=WEBSITE_NAME,
-        ad_settings=ad_settings or {},
-        predefined_categories=all_categories,
-        quote=quote
-    )
+    return dict(website_name=WEBSITE_NAME, ad_settings=ad_settings or {}, predefined_categories=all_categories, quote=quote)
 
 # =========================================================================================
 # === [START] HTML TEMPLATES ============================================================
 # =========================================================================================
-# (আপনার দেওয়া সকল HTML টেমপ্লেট এখানে থাকবে। আমি জায়গা বাঁচাতে এগুলোকে সংক্ষিপ্ত করছি)
 index_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -461,7 +446,7 @@ index_html = """
           {% endif %}
       {% endmacro %}
       
-      {{ render_grid_section('Trending Now', categorized_content['Trending'], 'Trending') }}
+      {{ render_grid_section('Trending Now', categorized_content.get('Trending', []), 'Trending') }}
       {{ render_grid_section('Latest Movies & Series', latest_content, 'Latest') }}
       {% if ad_settings.ad_list_page %}<div class="ad-container">{{ ad_settings.ad_list_page | safe }}</div>{% endif %}
       {% for cat_name, movies_list in categorized_content.items() %}
@@ -488,49 +473,54 @@ index_html = """
 </div>
 <script src="https://unpkg.com/swiper/swiper-bundle.min.js"></script>
 <script>
-    const header = document.querySelector('.main-header');
-    window.addEventListener('scroll', () => { window.scrollY > 10 ? header.classList.add('scrolled') : header.classList.remove('scrolled'); });
-    const menuToggle = document.querySelector('.menu-toggle');
-    const mobileMenu = document.querySelector('.mobile-nav-menu');
-    const closeBtn = document.querySelector('.close-btn');
-    if (menuToggle && mobileMenu && closeBtn) {
-        menuToggle.addEventListener('click', () => { mobileMenu.classList.add('active'); });
-        closeBtn.addEventListener('click', () => { mobileMenu.classList.remove('active'); });
-        document.querySelectorAll('.mobile-links a').forEach(link => { link.addEventListener('click', () => { mobileMenu.classList.remove('active'); }); });
-    }
-    const liveSearchBtn = document.getElementById('live-search-btn');
-    const searchOverlay = document.getElementById('search-overlay');
-    const closeSearchBtn = document.getElementById('close-search-btn');
-    const searchInputLive = document.getElementById('search-input-live');
-    const searchResultsLive = document.getElementById('search-results-live');
-    let debounceTimer;
-    liveSearchBtn.addEventListener('click', () => { searchOverlay.classList.add('active'); searchInputLive.focus(); });
-    closeSearchBtn.addEventListener('click', () => { searchOverlay.classList.remove('active'); });
-    searchInputLive.addEventListener('input', () => {
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-            const query = searchInputLive.value.trim();
-            if (query.length > 1) {
-                searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Searching...</p>';
-                fetch(`/api/search?q=${encodeURIComponent(query)}`).then(response => response.json()).then(data => {
-                    let html = '';
-                    if (data.length > 0) {
-                        data.forEach(item => { html += `<a href="/movie/${item._id}" class="search-result-item"><img src="${item.poster}" alt="${item.title}"><span>${item.title}</span></a>`; });
-                    } else { html = '<p style="color: #555; text-align: center;">No results found.</p>'; }
-                    searchResultsLive.innerHTML = html;
-                });
-            } else { searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Start typing to see results</p>'; }
-        }, 300);
-    });
-    new Swiper('.hero-slider', {
-        loop: true, autoplay: { delay: 5000, disableOnInteraction: false },
-        pagination: { el: '.swiper-pagination', clickable: true },
-        effect: 'fade', fadeEffect: { crossFade: true },
+    document.addEventListener('DOMContentLoaded', function () {
+        const header = document.querySelector('.main-header');
+        window.addEventListener('scroll', () => { window.scrollY > 10 ? header.classList.add('scrolled') : header.classList.remove('scrolled'); });
+        const menuToggle = document.querySelector('.menu-toggle');
+        const mobileMenu = document.querySelector('.mobile-nav-menu');
+        const closeBtn = document.querySelector('.close-btn');
+        if (menuToggle && mobileMenu && closeBtn) {
+            menuToggle.addEventListener('click', () => { mobileMenu.classList.add('active'); });
+            closeBtn.addEventListener('click', () => { mobileMenu.classList.remove('active'); });
+            document.querySelectorAll('.mobile-links a').forEach(link => { link.addEventListener('click', () => { mobileMenu.classList.remove('active'); }); });
+        }
+        const liveSearchBtn = document.getElementById('live-search-btn');
+        const searchOverlay = document.getElementById('search-overlay');
+        const closeSearchBtn = document.getElementById('close-search-btn');
+        const searchInputLive = document.getElementById('search-input-live');
+        const searchResultsLive = document.getElementById('search-results-live');
+        let debounceTimer;
+        liveSearchBtn.addEventListener('click', () => { searchOverlay.classList.add('active'); searchInputLive.focus(); });
+        closeSearchBtn.addEventListener('click', () => { searchOverlay.classList.remove('active'); });
+        searchInputLive.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                const query = searchInputLive.value.trim();
+                if (query.length > 1) {
+                    searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Searching...</p>';
+                    fetch(`/api/search?q=${encodeURIComponent(query)}`).then(response => response.json()).then(data => {
+                        let html = '';
+                        if (data.length > 0) {
+                            data.forEach(item => { html += `<a href="/movie/${item._id}" class="search-result-item"><img src="${item.poster}" alt="${item.title}"><span>${item.title}</span></a>`; });
+                        } else { html = '<p style="color: #555; text-align: center;">No results found.</p>'; }
+                        searchResultsLive.innerHTML = html;
+                    });
+                } else { searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Start typing to see results</p>'; }
+            }, 300);
+        });
+        if (document.querySelector('.hero-slider')) {
+            new Swiper('.hero-slider', {
+                loop: true, autoplay: { delay: 5000, disableOnInteraction: false },
+                pagination: { el: '.swiper-pagination', clickable: true },
+                effect: 'fade', fadeEffect: { crossFade: true },
+            });
+        }
     });
 </script>
 {{ ad_settings.ad_footer | safe }}
 </body></html>
 """
+
 detail_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -539,8 +529,8 @@ detail_html = """
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>{{ movie.title if movie else "Content Not Found" }} - {{ website_name }}</title>
 <link rel="icon" href="https://img.icons8.com/fluency/48/cinema-.png" type="image/png">
-<meta name="description" content="{{ movie.overview|striptags|truncate(160) }}">
-<meta name="keywords" content="{{ movie.title }}, movie details, download {{ movie.title }}, {{ website_name }}">
+<meta name="description" content="{{ movie.overview|striptags|truncate(160) if movie.overview }}">
+<meta name="keywords" content="{{ movie.title if movie else 'movie' }}, movie details, download, {{ website_name }}">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
 <link rel="stylesheet" href="https://unpkg.com/swiper/swiper-bundle.min.css"/>
@@ -577,26 +567,18 @@ detail_html = """
   .link-group:last-child { border-bottom: none; }
   .link-group h3 { font-size: 1.2rem; font-weight: 500; margin-bottom: 20px; }
   .link-buttons { display: inline-flex; flex-wrap: wrap; gap: 15px; justify-content: center;}
-  .quality-group { margin-bottom: 20px; }
-  .quality-group h4 { margin-bottom: 10px; color: var(--text-dark); }
   .episode-list { display: flex; flex-direction: column; gap: 10px; }
   .episode-item { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; background-color: var(--card-bg); padding: 15px; border-radius: 8px; }
   .episode-name { font-weight: 500; }
-  .ad-container { margin: 20px auto; width: 100%; max-width: 100%; display: flex; justify-content: center; align-items: center; overflow: hidden; min-height: 50px; text-align: center; }
-  .ad-container > * { max-width: 100% !important; }
   .category-section { margin: 50px 0; }
-  .category-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
   .category-title { font-size: 1.5rem; font-weight: 600; }
   .movie-carousel .swiper-slide { width: 150px; }
   .movie-card { display: block; position: relative; }
   .movie-poster { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 8px; margin-bottom: 10px; }
   .card-title { font-size: 0.9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .card-meta { font-size: 0.8rem; color: var(--text-dark); }
   .swiper-button-next, .swiper-button-prev { color: var(--text-light); display: none; }
-
   @media (min-width: 768px) {
     .container { padding: 0 40px; }
-    .detail-hero { padding: 120px 0 60px; }
     .detail-content { flex-direction: row; text-align: left; }
     .detail-poster { width: 300px; height: 450px; }
     .detail-title { font-size: 3rem; }
@@ -620,7 +602,6 @@ detail_html = """
             <div class="detail-meta">
                 {% if movie.vote_average %}<div class="meta-item rating"><i class="fas fa-star"></i> {{ "%.1f"|format(movie.vote_average) }}</div>{% endif %}
                 {% if movie.release_date %}<div class="meta-item"><i class="fas fa-calendar-alt"></i> {{ movie.release_date.split('-')[0] }}</div>{% endif %}
-                {% if movie.language %}<div class="meta-item"><i class="fas fa-language"></i> {{ movie.language }}</div>{% endif %}
                 {% if movie.genres %}<div class="meta-item"><i class="fas fa-tag"></i> {{ movie.genres | join(' / ') }}</div>{% endif %}
             </div>
             <p class="detail-overview">{{ movie.overview }}</p>
@@ -629,125 +610,44 @@ detail_html = """
 </div>
 <div class="container">
     <div class="tabs-container">
-        {% set episode_seasons = movie.episodes | map(attribute='season') | list if movie.episodes else [] %}
-        {% set pack_seasons = movie.season_packs | map(attribute='season_number') | list if movie.season_packs else [] %}
-        {% set all_seasons = (episode_seasons + pack_seasons) | unique | sort %}
         <nav class="tabs-nav">
-            {% if movie.type == 'movie' %}
-                <div class="tab-link active" data-tab="downloads"><i class="fas fa-download"></i> Download Links</div>
-            {% elif all_seasons %}
-                {% for season_num in all_seasons %}
-                    <div class="tab-link {% if loop.first %}active{% endif %}" data-tab="season-{{ season_num }}">Season {{ season_num }}</div>
-                {% endfor %}
-            {% else %}
-                 <div class="tab-link active" data-tab="no-links">Links</div>
-            {% endif %}
+            <div class="tab-link active" data-tab="downloads"><i class="fas fa-download"></i> Links</div>
         </nav>
         <div class="tabs-content">
-            {% if movie.type == 'movie' %}
             <div class="tab-pane active" id="downloads">
-                {% if ad_settings.ad_detail_page %}<div class="ad-container">{{ ad_settings.ad_detail_page | safe }}</div>{% endif %}
-                {% if movie.links %}
-                <div class="link-group">
-                    <h3>Watch & Download Links</h3>
-                    {% for link_item in movie.links %}
-                    <div class="quality-group">
-                        <h4>{{ link_item.quality }}</h4>
+                {% if movie.telegram_ref %}
+                    <div class="link-group">
+                        <h3>Watch & Download</h3>
                         <div class="link-buttons">
-                            {% if link_item.watch_url %}<a href="{{ url_for('wait_page', target=quote(link_item.watch_url)) }}" class="action-btn btn-watch"><i class="fas fa-play"></i> Watch Now</a>{% endif %}
-                            {% if link_item.download_url %}<a href="{{ url_for('wait_page', target=quote(link_item.download_url)) }}" class="action-btn btn-download"><i class="fas fa-download"></i> Download</a>{% endif %}
+                            <a href="{{ url_for('stream_page', movie_id=movie._id) }}" class="action-btn btn-watch"><i class="fas fa-play"></i> Watch Now</a>
+                            <a href="{{ url_for('download_file', movie_id=movie._id) }}" class="action-btn btn-download"><i class="fas fa-download"></i> Download</a>
                         </div>
                     </div>
-                    {% endfor %}
-                </div>
-                {% endif %}
-                {% if movie.manual_links %}
-                <div class="link-group">
-                    <h3>Custom Download Links</h3>
-                    <div class="link-buttons">
+                {% elif movie.manual_links %}
+                    <div class="link-group">
+                        <h3>Download Links</h3>
+                        <div class="link-buttons">
                         {% for link in movie.manual_links %}
                             <a href="{{ url_for('wait_page', target=quote(link.url)) }}" class="action-btn btn-download">{{ link.name }}</a>
                         {% endfor %}
+                        </div>
                     </div>
-                </div>
-                {% endif %}
-                {% if not movie.links and not movie.manual_links %}
+                {% else %}
                     <p style="text-align:center;">No links available yet.</p>
                 {% endif %}
             </div>
-            {% elif all_seasons %}
-                {% for season_num in all_seasons %}
-                <div class="tab-pane {% if loop.first %}active{% endif %}" id="season-{{ season_num }}">
-                    {% set season_pack = (movie.season_packs | selectattr('season_number', 'equalto', season_num) | first) if movie.season_packs else None %}
-                    {% if loop.first and movie.manual_links %}
-                    <div class="link-group">
-                        <h3>Custom Download Links</h3>
-                        <div class="link-buttons">
-                            {% for link in movie.manual_links %}
-                                <a href="{{ url_for('wait_page', target=quote(link.url)) }}" class="action-btn btn-download">{{ link.name }}</a>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
-                    {% if season_pack and (season_pack.watch_link or season_pack.download_link) %}
-                    <div class="link-group">
-                        <h3>Complete Season {{ season_num }} Links</h3>
-                        <div class="link-buttons">
-                            {% if season_pack.watch_link %}
-                                <a href="{{ url_for('wait_page', target=quote(season_pack.watch_link)) }}" class="action-btn btn-watch"><i class="fas fa-play-circle"></i> Watch All Episodes</a>
-                            {% endif %}
-                            {% if season_pack.download_link %}
-                                <a href="{{ url_for('wait_page', target=quote(season_pack.download_link)) }}" class="action-btn btn-download"><i class="fas fa-cloud-download-alt"></i> Download All Episodes</a>
-                            {% endif %}
-                        </div>
-                    </div>
-                    {% endif %}
-                    {% set episodes_for_season = movie.episodes | selectattr('season', 'equalto', season_num) | list %}
-                    {% if episodes_for_season %}
-                    <div class="episode-list">
-                        {% for ep in episodes_for_season | sort(attribute='episode_number') %}
-                        <div class="episode-item">
-                            <span class="episode-name"><i class="fas fa-play-circle"></i> Episode {{ ep.episode_number }} {% if ep.title %}- {{ep.title}}{% endif %}</span>
-                            {% if ep.watch_link %}<a href="{{ url_for('wait_page', target=quote(ep.watch_link)) }}" class="action-btn btn-download">Download / Watch</a>{% endif %}
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% elif not season_pack and not (loop.first and movie.manual_links) %}
-                        <p style="text-align:center;">No links or episodes available for this season yet.</p>
-                    {% endif %}
-                </div>
-                {% endfor %}
-            {% else %}
-                <div class="tab-pane active" id="no-links">
-                    {% if movie.manual_links %}
-                    <div class="link-group">
-                        <h3>Custom Download Links</h3>
-                        <div class="link-buttons">
-                            {% for link in movie.manual_links %}
-                                <a href="{{ url_for('wait_page', target=quote(link.url)) }}" class="action-btn btn-download">{{ link.name }}</a>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% else %}
-                    <p style="text-align:center;">No links or episodes available yet.</p>
-                    {% endif %}
-                </div>
-            {% endif %}
         </div>
     </div>
     {% if related_content %}
     <section class="category-section">
-        <div class="category-header">
-            <h2 class="category-title">You Might Also Like</h2>
-        </div>
-        <div class="swiper movie-carousel">
+        <h2 class="category-title">You Might Also Like</h2>
+        <div class="swiper movie-carousel" style="margin-top: 20px;">
             <div class="swiper-wrapper">
                 {% for m in related_content %}
                 <div class="swiper-slide">
                     <a href="{{ url_for('movie_detail', movie_id=m._id) }}" class="movie-card">
-                        <img class="movie-poster" loading="lazy" src="{{ m.poster or 'https://via.placeholder.com/400x600.png?text=No+Image' }}" alt="{{ m.title }}">
+                        <img class="movie-poster" src="{{ m.poster or 'https://via.placeholder.com/400x600.png?text=No+Image' }}" alt="{{ m.title }}">
                         <h4 class="card-title">{{ m.title }}</h4>
-                        <p class="card-meta">{{ m.release_date.split('-')[0] if m.release_date else '' }}</p>
                     </a>
                 </div>
                 {% endfor %}
@@ -760,28 +660,68 @@ detail_html = """
 {% else %}<div style="display:flex; justify-content:center; align-items:center; height:100vh;"><h2>Content not found.</h2></div>{% endif %}
 <script src="https://unpkg.com/swiper/swiper-bundle.min.js"></script>
 <script>
-    const tabLinks = document.querySelectorAll('.tab-link'), tabPanes = document.querySelectorAll('.tab-pane');
-    tabLinks.forEach(link => { link.addEventListener('click', () => {
-        const tabId = link.getAttribute('data-tab');
-        tabLinks.forEach(item => item.classList.remove('active'));
-        tabPanes.forEach(pane => pane.classList.remove('active'));
-        link.classList.add('active');
-        const targetPane = document.getElementById(tabId);
-        if(targetPane) targetPane.classList.add('active');
-    }); });
-
-    new Swiper('.movie-carousel', {
-        slidesPerView: 'auto',
-        spaceBetween: 15,
-        navigation: {
-            nextEl: '.swiper-button-next',
-            prevEl: '.swiper-button-prev',
+    document.addEventListener('DOMContentLoaded', function () {
+        if (document.querySelector('.movie-carousel')) {
+            new Swiper('.movie-carousel', {
+                slidesPerView: 'auto', spaceBetween: 15,
+                navigation: { nextEl: '.swiper-button-next', prevEl: '.swiper-button-prev' }
+            });
         }
     });
 </script>
 {{ ad_settings.ad_footer | safe }}
 </body></html>
 """
+
+stream_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Watching: {{ movie.title }} - {{ website_name }}</title>
+    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #000; font-family: 'Poppins', sans-serif; }
+        .container { width: 100%; height: 100%; }
+        .plyr { width: 100%; height: 100%; --plyr-color-main: #E50914; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% if stream_link %}
+        <video id="player" playsinline controls data-poster="{{ movie.backdrop or movie.poster }}">
+            <source src="{{ stream_link }}" type="video/mp4" />
+        </video>
+        {% else %}
+        <div style="color: white; text-align: center; padding-top: 40vh;">
+            <h2>Could not generate stream link.</h2>
+            <p>This might be a temporary issue. Please try again in a few moments.</p>
+        </div>
+        {% endif %}
+    </div>
+    <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const video = document.getElementById('player');
+            if (video) {
+                const source = video.getElementsByTagName('source')[0].src;
+                const player = new Plyr(video, {
+                    title: '{{ movie.title }}',
+                });
+                if (Hls.isSupported() && source.includes('.m3u8')) {
+                    const hls = new Hls();
+                    hls.loadSource(source);
+                    hls.attachMedia(video);
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
 wait_page_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -791,7 +731,7 @@ wait_page_html = """
     <title>Generating Link... - {{ website_name }}</title>
     <link rel="icon" href="https://img.icons8.com/fluency/48/cinema-.png" type="image/png">
     <meta name="robots" content="noindex, nofollow">
-    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet">
     {{ ad_settings.ad_header | safe }}
     <style>
         :root {--primary-color: #E50914; --bg-color: #000000; --text-light: #ffffff; --text-dark: #a0a0a0;}
@@ -802,8 +742,6 @@ wait_page_html = """
         .timer { font-size: 2.5rem; font-weight: 700; color: var(--text-light); margin-bottom: 30px; }
         .get-link-btn { display: inline-block; text-decoration: none; color: white; font-weight: 600; cursor: pointer; border: none; padding: 12px 30px; border-radius: 50px; font-size: 1rem; background-color: #555; transition: background-color 0.2s; }
         .get-link-btn.ready { background-color: var(--primary-color); }
-        .ad-container { margin: 30px auto 0; width: 100%; max-width: 100%; display: flex; justify-content: center; align-items: center; overflow: hidden; min-height: 50px; text-align: center; }
-        .ad-container > * { max-width: 100% !important; }
     </style>
 </head>
 <body>
@@ -840,6 +778,7 @@ wait_page_html = """
 </body>
 </html>
 """
+
 request_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -849,7 +788,7 @@ request_html = """
     <title>Request Content - {{ website_name }}</title>
     <link rel="icon" href="https://img.icons8.com/fluency/48/cinema-.png" type="image/png">
     <meta name="robots" content="noindex, nofollow">
-    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
     {{ ad_settings.ad_header | safe }}
     <style>
@@ -866,9 +805,6 @@ request_html = """
         textarea { resize: vertical; min-height: 80px; }
         .btn-submit { display: block; width: 100%; text-decoration: none; color: white; font-weight: 600; cursor: pointer; border: none; padding: 14px; border-radius: 5px; font-size: 1.1rem; background-color: var(--primary-color); transition: background-color 0.2s; }
         .btn-submit:hover { background-color: #B20710; }
-        .flash-message { padding: 15px; border-radius: 5px; margin-bottom: 20px; text-align: center; }
-        .flash-success { background-color: #28a745; color: white; }
-        .flash-error { background-color: #dc3545; color: white; }
     </style>
 </head>
 <body>
@@ -878,13 +814,6 @@ request_html = """
         <div class="request-container">
             <h1>Request Content</h1>
             <p>Can't find what you're looking for? Let us know!</p>
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="flash-message flash-{{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
             <form method="post">
                 <div class="form-group">
                     <label for="content_name">Movie/Series Name</label>
@@ -892,7 +821,7 @@ request_html = """
                 </div>
                 <div class="form-group">
                     <label for="extra_info">Additional Information (Optional)</label>
-                    <textarea id="extra_info" name="extra_info" placeholder="e.g., Release year, language, specific season..."></textarea>
+                    <textarea id="extra_info" name="extra_info" placeholder="e.g., Release year, language..."></textarea>
                 </div>
                 <button type="submit" class="btn-submit">Submit Request</button>
             </form>
@@ -902,6 +831,7 @@ request_html = """
 </body>
 </html>
 """
+
 admin_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1038,7 +968,7 @@ admin_html = """
     </form>
     <hr>
 
-    <h2><i class="fas fa-plus-circle"></i> Add New Content</h2>
+    <h2><i class="fas fa-plus-circle"></i> Add New Content (Manual)</h2>
     <fieldset><legend>Automatic Method (Search TMDB)</legend><div class="form-group"><div class="tmdb-fetcher"><input type="text" id="tmdb_search_query" placeholder="e.g., Avengers Endgame"><button type="button" id="tmdb_search_btn" class="btn btn-primary" onclick="searchTmdb()">Search</button></div></div></fieldset>
     <form method="post">
         <input type="hidden" name="form_action" value="add_content"><input type="hidden" name="tmdb_id" id="tmdb_id">
@@ -1052,19 +982,7 @@ admin_html = """
             <div class="form-group"><label>Categories:</label><div class="checkbox-group">{% for cat in categories_list %}<label><input type="checkbox" name="categories" value="{{ cat.name }}"> {{ cat.name }}</label>{% endfor %}</div></div>
             <div class="form-group"><label>Content Type:</label><select name="content_type" id="content_type" onchange="toggleFields()"><option value="movie">Movie</option><option value="series">Series</option></select></div>
         </fieldset>
-        <div id="movie_fields">
-            <fieldset><legend>Movie Links</legend>
-                <div class="link-pair"><label>480p Watch Link:<input type="url" name="watch_link_480p"></label><label>480p Download Link:<input type="url" name="download_link_480p"></label></div>
-                <div class="link-pair"><label>720p Watch Link:<input type="url" name="watch_link_720p"></label><label>720p Download Link:<input type="url" name="download_link_720p"></label></div>
-                <div class="link-pair"><label>1080p Watch Link:<input type="url" name="watch_link_1080p"></label><label>1080p Download Link:<input type="url" name="download_link_1080p"></label></div>
-            </fieldset>
-        </div>
-        <div id="episode_fields" style="display: none;">
-            <fieldset><legend>Series Links</legend>
-                <label>Complete Season Packs:</label><div id="season_packs_container"></div><button type="button" onclick="addSeasonPackField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Season Pack</button><hr style="margin: 20px 0;"><label>Individual Episodes:</label><div id="episodes_container"></div><button type="button" onclick="addEpisodeField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Episode</button>
-            </fieldset>
-        </div>
-        <fieldset><legend>Manual Download Buttons</legend><div id="manual_links_container"></div><button type="button" onclick="addManualLinkField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Manual Button</button></fieldset>
+        <fieldset id="manual_links_fieldset"><legend>Manual Download Buttons</legend><div id="manual_links_container"></div><button type="button" onclick="addManualLinkField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Manual Button</button></fieldset>
         <button type="submit" class="btn btn-primary"><i class="fas fa-check"></i> Add Content</button>
     </form>
     <hr>
@@ -1079,33 +997,30 @@ admin_html = """
     </div>
     <form method="post" id="bulk-action-form">
         <input type="hidden" name="form_action" value="bulk_delete">
-        <div class="table-container"><table><thead><tr><th><input type="checkbox" id="select-all"></th><th>Title</th><th>Type</th><th>Actions</th></tr></thead><tbody>
-        {% for movie in content_list %}<tr><td><input type="checkbox" name="selected_ids" value="{{ movie._id }}" class="row-checkbox"></td><td>{{ movie.title }}</td><td>{{ movie.type|title }}</td><td class="action-buttons"><a href="{{ url_for('edit_movie', movie_id=movie._id) }}" class="btn btn-edit">Edit</a><a href="{{ url_for('delete_movie', movie_id=movie._id) }}" onclick="return confirm('Are you sure?')" class="btn btn-danger">Delete</a></td></tr>{% else %}<tr><td colspan="4" style="text-align:center;">No content found.</td></tr>{% endfor %}
+        <div class="table-container"><table><thead><tr><th><input type="checkbox" id="select-all"></th><th>Title</th><th>Type</th><th>Source</th><th>Actions</th></tr></thead><tbody>
+        {% for movie in content_list %}<tr><td><input type="checkbox" name="selected_ids" value="{{ movie._id }}" class="row-checkbox"></td><td>{{ movie.title }}</td><td>{{ movie.type|title }}</td><td>{{ 'Telegram' if movie.telegram_ref else 'Manual' }}</td><td class="action-buttons"><a href="{{ url_for('edit_movie', movie_id=movie._id) }}" class="btn btn-edit">Edit</a><a href="{{ url_for('delete_movie', movie_id=movie._id) }}" onclick="return confirm('Are you sure?')" class="btn btn-danger">Delete</a></td></tr>{% else %}<tr><td colspan="5" style="text-align:center;">No content found.</td></tr>{% endfor %}
         </tbody></table></div>
         <button type="submit" class="btn btn-danger" style="margin-top: 15px;" onclick="return confirm('Are you sure you want to delete all selected items?')"><i class="fas fa-trash-alt"></i> Delete Selected</button>
     </form>
 </div>
 <div class="modal-overlay" id="search-modal"><div class="modal-content"><div class="modal-header"><h2>Select Content</h2><button class="modal-close" onclick="closeModal()">&times;</button></div><div class="modal-body" id="search-results"></div></div></div>
 <script>
-    function toggleFields() { const isSeries = document.getElementById('content_type').value === 'series'; document.getElementById('episode_fields').style.display = isSeries ? 'block' : 'none'; document.getElementById('movie_fields').style.display = isSeries ? 'none' : 'block'; }
-    function addEpisodeField() { const c = document.getElementById('episodes_container'); const d = document.createElement('div'); d.className = 'dynamic-item'; d.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="form-group"><label>Season:</label><input type="number" name="episode_season[]" value="1" required></div><div class="form-group"><label>Episode:</label><input type="number" name="episode_number[]" required></div><div class="form-group"><label>Title:</label><input type="text" name="episode_title[]"></div><div class="form-group"><label>Download/Watch Link:</label><input type="url" name="episode_watch_link[]" required></div>`; c.appendChild(d); }
-    function addSeasonPackField() { const container = document.getElementById('season_packs_container'); const newItem = document.createElement('div'); newItem.className = 'dynamic-item'; newItem.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="season-pack-item"><div class="form-group"><label>Season No.</label><input type="number" name="season_pack_number[]" value="1" required></div><div class="form-group"><label>Complete Watch Link</label><input type="url" name="season_pack_watch_link[]"></div><div class="form-group"><label>Complete Download Link</label><input type="url" name="season_pack_download_link[]"></div></div>`; container.appendChild(newItem); }
-    function addManualLinkField() { const container = document.getElementById('manual_links_container'); const newItem = document.createElement('div'); newItem.className = 'dynamic-item'; newItem.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="link-pair"><div class="form-group"><label>Button Name</label><input type="text" name="manual_link_name[]" placeholder="e.g., 480p G-Drive" required></div><div class="form-group"><label>Link URL</label><input type="url" name="manual_link_url[]" placeholder="https://..." required></div></div>`; container.appendChild(newItem); }
+    function addManualLinkField() { const container = document.getElementById('manual_links_container'); const newItem = document.createElement('div'); newItem.className = 'dynamic-item'; newItem.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="link-pair"><div class="form-group"><label>Button Name</label><input type="text" name="manual_link_name[]" required></div><div class="form-group"><label>Link URL</label><input type="url" name="manual_link_url[]" required></div></div>`; container.appendChild(newItem); }
     function openModal() { document.getElementById('search-modal').style.display = 'flex'; }
     function closeModal() { document.getElementById('search-modal').style.display = 'none'; }
-    async function searchTmdb() { const query = document.getElementById('tmdb_search_query').value.trim(); if (!query) return; const searchBtn = document.getElementById('tmdb_search_btn'); searchBtn.disabled = true; searchBtn.innerHTML = 'Searching...'; openModal(); try { const response = await fetch('/admin/api/search?query=' + encodeURIComponent(query)); const results = await response.json(); const container = document.getElementById('search-results'); container.innerHTML = ''; if(results.length > 0) { results.forEach(item => { const resultDiv = document.createElement('div'); resultDiv.className = 'result-item'; resultDiv.onclick = () => selectResult(item.id, item.media_type); resultDiv.innerHTML = `<img src="${item.poster}" alt="${item.title}"><p><strong>${item.title}</strong> (${item.year})</p>`; container.appendChild(resultDiv); }); } else { container.innerHTML = '<p>No results found.</p>'; } } catch (e) { console.error(e); } finally { searchBtn.disabled = false; searchBtn.innerHTML = 'Search'; } }
-    async function selectResult(tmdbId, mediaType) { closeModal(); try { const response = await fetch(`/admin/api/details?id=${tmdbId}&type=${mediaType}`); const data = await response.json(); document.getElementById('tmdb_id').value = data.tmdb_id || ''; document.getElementById('title').value = data.title || ''; document.getElementById('overview').value = data.overview || ''; document.getElementById('poster').value = data.poster || ''; document.getElementById('backdrop').value = data.backdrop || ''; document.getElementById('genres').value = data.genres ? data.genres.join(', ') : ''; document.getElementById('content_type').value = data.type === 'series' ? 'series' : 'movie'; toggleFields(); } catch (e) { console.error(e); } }
-    document.addEventListener('DOMContentLoaded', function() { toggleFields(); const selectAll = document.getElementById('select-all'); if(selectAll) { selectAll.addEventListener('change', e => document.querySelectorAll('.row-checkbox').forEach(c => c.checked = e.target.checked)); } });
+    async function searchTmdb() { const query = document.getElementById('tmdb_search_query').value.trim(); if (!query) return; const searchBtn = document.getElementById('tmdb_search_btn'); searchBtn.disabled = true; searchBtn.innerHTML = 'Searching...'; openModal(); try { const response = await fetch('/admin/api/search?query=' + encodeURIComponent(query)); const results = await response.json(); const container = document.getElementById('search-results'); container.innerHTML = ''; if(results.length > 0) { results.forEach(item => { const resultDiv = document.createElement('div'); resultDiv.className = 'result-item'; resultDiv.onclick = () => selectResult(item.id, item.media_type); resultDiv.innerHTML = `<img src="${item.poster}" alt="${item.title}"><p><strong>${item.title}</strong> (${item.year})</p>`; container.appendChild(resultDiv); }); } else { container.innerHTML = '<p>No results found.</p>'; } } finally { searchBtn.disabled = false; searchBtn.innerHTML = 'Search'; } }
+    async function selectResult(tmdbId, mediaType) { closeModal(); try { const response = await fetch(`/admin/api/details?id=${tmdbId}&type=${mediaType}`); const data = await response.json(); document.getElementById('tmdb_id').value = data.tmdb_id || ''; document.getElementById('title').value = data.title || ''; document.getElementById('overview').value = data.overview || ''; document.getElementById('poster').value = data.poster || ''; document.getElementById('backdrop').value = data.backdrop || ''; document.getElementById('genres').value = data.genres ? data.genres.join(', ') : ''; document.getElementById('content_type').value = data.type === 'series' ? 'series' : 'movie'; } catch (e) { console.error(e); } }
+    document.addEventListener('DOMContentLoaded', function() { const selectAll = document.getElementById('select-all'); if(selectAll) { selectAll.addEventListener('change', e => document.querySelectorAll('.row-checkbox').forEach(c => c.checked = e.target.checked)); } });
 </script>
 </body></html>
 """
+
 edit_html = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edit Content - {{ website_name }}</title>
-    <link rel="icon" href="https://img.icons8.com/fluency/48/cinema-.png" type="image/png">
     <meta name="robots" content="noindex, nofollow">
     <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Roboto:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
@@ -1121,13 +1036,12 @@ edit_html = """
         .form-group { margin-bottom: 15px; } label { display: block; margin-bottom: 8px; font-weight: bold;}
         input, textarea, select { width: 100%; padding: 12px; border-radius: 4px; border: 1px solid var(--light-gray); font-size: 1rem; background: var(--light-gray); color: var(--text-light); box-sizing: border-box; }
         .btn { display: inline-block; color: white; cursor: pointer; border: none; padding: 12px 25px; border-radius: 4px; font-size: 1rem; }
-        .btn-primary { background: var(--netflix-red); } .btn-secondary { background: #555; } .btn-danger { background: #dc3545; }
+        .btn-primary { background: var(--netflix-red); }
         .dynamic-item { border: 1px solid var(--light-gray); padding: 15px; margin-bottom: 15px; border-radius: 5px; position: relative; }
-        .dynamic-item .btn-danger { position: absolute; top: 10px; right: 10px; padding: 4px 8px; font-size: 0.8rem; }
+        .dynamic-item .btn-danger { position: absolute; top: 10px; right: 10px; padding: 4px 8px; font-size: 0.8rem; background: #dc3545;}
         .checkbox-group { display: flex; flex-wrap: wrap; gap: 15px; } .checkbox-group label { display: flex; align-items: center; gap: 5px; font-weight: normal; }
         .checkbox-group input { width: auto; }
         .link-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
-        .season-pack-item { display: grid; grid-template-columns: 100px 1fr 1fr; gap: 10px; align-items: flex-end; }
     </style>
 </head>
 <body>
@@ -1140,73 +1054,29 @@ edit_html = """
         <div class="form-group"><label>Poster URL:</label><input type="url" name="poster" value="{{ movie.poster or '' }}"></div>
         <div class="form-group"><label>Backdrop URL:</label><input type="url" name="backdrop" value="{{ movie.backdrop or '' }}"></div>
         <div class="form-group"><label>Overview:</label><textarea name="overview">{{ movie.overview or '' }}</textarea></div>
-        <div class="form-group"><label>Language:</label><input type="text" name="language" value="{{ movie.language or '' }}"></div>
-        <div class="form-group"><label>Genres:</label><input type="text" name="genres" value="{{ movie.genres|join(', ') if movie.genres else '' }}"></div>
         <div class="form-group"><label>Categories:</label><div class="checkbox-group">{% for cat in categories_list %}<label><input type="checkbox" name="categories" value="{{ cat.name }}" {% if movie.categories and cat.name in movie.categories %}checked{% endif %}> {{ cat.name }}</label>{% endfor %}</div></div>
-        <div class="form-group"><label>Content Type:</label><select name="content_type" id="content_type" onchange="toggleFields()"><option value="movie" {% if movie.type == 'movie' %}selected{% endif %}>Movie</option><option value="series" {% if movie.type == 'series' %}selected{% endif %}>Series</option></select></div>
     </fieldset>
-    <div id="movie_fields">
-        <fieldset><legend>Movie Links</legend>
-            {% set links_480p = movie.links|selectattr('quality', 'equalto', '480p')|first if movie.links else None %}
-            {% set links_720p = movie.links|selectattr('quality', 'equalto', '720p')|first if movie.links else None %}
-            {% set links_1080p = movie.links|selectattr('quality', 'equalto', '1080p')|first if movie.links else None %}
-            <div class="link-pair"><label>480p Watch Link:<input type="url" name="watch_link_480p" value="{{ links_480p.watch_url if links_480p else '' }}"></label><label>480p Download Link:<input type="url" name="download_link_480p" value="{{ links_480p.download_url if links_480p else '' }}"></label></div>
-            <div class="link-pair"><label>720p Watch Link:<input type="url" name="watch_link_720p" value="{{ links_720p.watch_url if links_720p else '' }}"></label><label>720p Download Link:<input type="url" name="download_link_720p" value="{{ links_720p.download_url if links_720p else '' }}"></label></div>
-            <div class="link-pair"><label>1080p Watch Link:<input type="url" name="watch_link_1080p" value="{{ links_1080p.watch_url if links_1080p else '' }}"></label><label>1080p Download Link:<input type="url" name="download_link_1080p" value="{{ links_1080p.download_url if links_1080p else '' }}"></label></div>
-        </fieldset>
-    </div>
-    <div id="episode_fields" style="display: none;">
-      <fieldset><legend>Series Links</legend>
-        <label>Complete Season Packs:</label><div id="season_packs_container">
-        {% if movie.type == 'series' and movie.season_packs %}{% for pack in movie.season_packs|sort(attribute='season_number') %}<div class="dynamic-item"><button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="season-pack-item"><div class="form-group"><label>Season No.</label><input type="number" name="season_pack_number[]" value="{{ pack.season_number }}" required></div><div class="form-group"><label>Watch Link</label><input type="url" name="season_pack_watch_link[]" value="{{ pack.watch_link or '' }}"></div><div class="form-group"><label>Download Link</label><input type="url" name="season_pack_download_link[]" value="{{ pack.download_link or '' }}"></div></div></div>{% endfor %}{% endif %}
-        </div><button type="button" onclick="addSeasonPackField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Season</button><hr style="margin: 20px 0;"><label>Individual Episodes:</label>
-        <div id="episodes_container">
-        {% if movie.type == 'series' and movie.episodes %}{% for ep in movie.episodes|sort(attribute='episode_number')|sort(attribute='season') %}<div class="dynamic-item"><button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="form-group"><label>Season:</label><input type="number" name="episode_season[]" value="{{ ep.season or 1 }}" required></div><div class="form-group"><label>Episode:</label><input type="number" name="episode_number[]" value="{{ ep.episode_number }}" required></div><div class="form-group"><label>Title:</label><input type="text" name="episode_title[]" value="{{ ep.title or '' }}"></div><div class="form-group"><label>Download/Watch Link:</label><input type="url" name="episode_watch_link[]" value="{{ ep.watch_link or '' }}" required></div></div>{% endfor %}{% endif %}</div><button type="button" onclick="addEpisodeField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Episode</button></fieldset>
-    </div>
+    {% if movie.manual_links %}
     <fieldset><legend>Manual Download Buttons</legend><div id="manual_links_container">
-        {% if movie.manual_links %}{% for link in movie.manual_links %}<div class="dynamic-item"><button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="link-pair"><div class="form-group"><label>Button Name</label><input type="text" name="manual_link_name[]" value="{{ link.name }}" required></div><div class="form-group"><label>Link URL</label><input type="url" name="manual_link_url[]" value="{{ link.url }}" required></div></div></div>{% endfor %}{% endif %}
-    </div><button type="button" onclick="addManualLinkField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Manual Button</button></fieldset>
+        {% for link in movie.manual_links %}<div class="dynamic-item"><button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="link-pair"><div class="form-group"><label>Button Name</label><input type="text" name="manual_link_name[]" value="{{ link.name }}" required></div><div class="form-group"><label>Link URL</label><input type="url" name="manual_link_url[]" value="{{ link.url }}" required></div></div></div>{% endfor %}
+    </div></button></fieldset>
+    {% endif %}
+    {% if movie.telegram_ref %}
+    <fieldset><legend>Telegram Source</legend><p>This content is linked from Telegram. Links are generated automatically. To add manual links, please create a new manual entry.</p></fieldset>
+    {% endif %}
     <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Update Content</button>
   </form>
 </div>
-<script>
-    function toggleFields() { var isSeries = document.getElementById('content_type').value === 'series'; document.getElementById('episode_fields').style.display = isSeries ? 'block' : 'none'; document.getElementById('movie_fields').style.display = isSeries ? 'none' : 'block'; }
-    function addEpisodeField() { const c = document.getElementById('episodes_container'); const d = document.createElement('div'); d.className = 'dynamic-item'; d.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="form-group"><label>Season:</label><input type="number" name="episode_season[]" value="1" required></div><div class="form-group"><label>Episode:</label><input type="number" name="episode_number[]" required></div><div class="form-group"><label>Title:</label><input type="text" name="episode_title[]"></div><div class="form-group"><label>Download/Watch Link:</label><input type="url" name="episode_watch_link[]" required></div>`; c.appendChild(d); }
-    function addSeasonPackField() { const container = document.getElementById('season_packs_container'); const newItem = document.createElement('div'); newItem.className = 'dynamic-item'; newItem.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="season-pack-item"><div class="form-group"><label>Season No.</label><input type="number" name="season_pack_number[]" value="1" required></div><div class="form-group"><label>Watch Link</label><input type="url" name="season_pack_watch_link[]"></div><div class="form-group"><label>Download Link</label><input type="url" name="season_pack_download_link[]"></div></div>`; container.appendChild(newItem); }
-    function addManualLinkField() { const container = document.getElementById('manual_links_container'); const newItem = document.createElement('div'); newItem.className = 'dynamic-item'; newItem.innerHTML = `<button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="link-pair"><div class="form-group"><label>Button Name</label><input type="text" name="manual_link_name[]" placeholder="e.g., 480p G-Drive" required></div><div class="form-group"><label>Link URL</label><input type="url" name="manual_link_url[]" placeholder="https://..." required></div></div>`; container.appendChild(newItem); }
-    document.addEventListener('DOMContentLoaded', toggleFields);
-</script>
 </body></html>
 """
 
-
 # =======================================================================================
-# === [START] HELPER FUNCTIONS & CLASSES ================================================
+# === [START] FLASK ROUTES ==============================================================
 # =======================================================================================
-def get_tmdb_details(tmdb_id, media_type):
-    search_type = "tv" if media_type == "tv" else "movie"
-    try:
-        detail_url = f"https://api.themoviedb.org/3/{search_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
-        res = requests.get(detail_url, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        return {
-            "tmdb_id": tmdb_id, "title": data.get("title") or data.get("name"),
-            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
-            "backdrop": f"https://image.tmdb.org/t/p/w1280{data.get('backdrop_path')}" if data.get('backdrop_path') else None,
-            "overview": data.get("overview"), "release_date": data.get("release_date") or data.get("first_air_date"),
-            "genres": [g['name'] for g in data.get("genres", [])], "vote_average": data.get("vote_average"),
-            "type": "series" if search_type == "tv" else "movie"
-        }
-    except requests.RequestException as e:
-        print(f"ERROR: TMDb API request failed: {e}")
-        return None
-
+# --- Helper Class ---
 class Pagination:
     def __init__(self, page, per_page, total_count):
-        self.page = page
-        self.per_page = per_page
-        self.total_count = total_count
+        self.page, self.per_page, self.total_count = page, per_page, total_count
     @property
     def total_pages(self): return math.ceil(self.total_count / self.per_page)
     @property
@@ -1218,22 +1088,25 @@ class Pagination:
     @property
     def next_num(self): return self.page + 1
 
-# =======================================================================================
-# === [START] FLASK ROUTES ==============================================================
-# =======================================================================================
+def get_paginated_content(query_filter, page):
+    skip = (page - 1) * ITEMS_PER_PAGE
+    total_count = movies.count_documents(query_filter)
+    content_list = list(movies.find(query_filter).sort('_id', -1).skip(skip).limit(ITEMS_PER_PAGE))
+    return content_list, Pagination(page, ITEMS_PER_PAGE, total_count)
+
+# --- Public Routes ---
 @app.route('/')
 def home():
     query = request.args.get('q', '').strip()
     if query:
-        movies_list = list(movies.find({"title": {"$regex": query, "$options": "i"}}).sort('_id', -1))
+        movies_list, _ = get_paginated_content({"title": {"$regex": query, "$options": "i"}}, 1)
         return render_template_string(index_html, movies=movies_list, query=f'Results for "{query}"', is_full_page_list=True)
     
     slider_content = list(movies.find({}).sort('_id', -1).limit(15))
     home_categories = [cat['name'] for cat in categories_collection.find().sort("name", 1)]
     categorized_content = {cat: list(movies.find({"categories": cat}).sort('_id', -1).limit(10)) for cat in home_categories}
     latest_content = list(movies.find().sort('_id', -1).limit(10))
-    context = {"slider_content": slider_content, "latest_content": latest_content, "categorized_content": categorized_content, "is_full_page_list": False}
-    return render_template_string(index_html, **context)
+    return render_template_string(index_html, slider_content=slider_content, latest_content=latest_content, categorized_content=categorized_content, is_full_page_list=False)
 
 @app.route('/movie/<movie_id>')
 def movie_detail(movie_id):
@@ -1244,15 +1117,8 @@ def movie_detail(movie_id):
         if movie.get('type'):
             related_content = list(movies.find({"type": movie['type'], "_id": {"$ne": movie['_id']}}).sort('_id', -1).limit(10))
         return render_template_string(detail_html, movie=movie, related_content=related_content)
-    except:
+    except Exception:
         return "Content not found", 404
-
-def get_paginated_content(query_filter, page):
-    skip = (page - 1) * ITEMS_PER_PAGE
-    total_count = movies.count_documents(query_filter)
-    content_list = list(movies.find(query_filter).sort('_id', -1).skip(skip).limit(ITEMS_PER_PAGE))
-    pagination = Pagination(page, ITEMS_PER_PAGE, total_count)
-    return content_list, pagination
 
 @app.route('/movies')
 def all_movies():
@@ -1271,30 +1137,48 @@ def movies_by_category():
     title = request.args.get('name')
     if not title: return redirect(url_for('home'))
     page = request.args.get('page', 1, type=int)
-    
     query_filter = {} if title == "Latest" else {"categories": title}
     content_list, pagination = get_paginated_content(query_filter, page)
-    query_title = "Latest Content" if title == "Latest" else title
-    return render_template_string(index_html, movies=content_list, query=query_title, is_full_page_list=True, pagination=pagination)
+    return render_template_string(index_html, movies=content_list, query=title, is_full_page_list=True, pagination=pagination)
 
 @app.route('/request', methods=['GET', 'POST'])
 def request_content():
     if request.method == 'POST':
-        content_name = request.form.get('content_name', '').strip()
-        extra_info = request.form.get('extra_info', '').strip()
-        if content_name:
-            requests_collection.insert_one({
-                "name": content_name, "info": extra_info,
-                "status": "Pending", "created_at": datetime.utcnow()
-            })
+        if request.form.get('content_name'):
+            requests_collection.insert_one({"name": request.form.get('content_name').strip(), "info": request.form.get('extra_info', '').strip(), "status": "Pending", "created_at": datetime.utcnow()})
         return redirect(url_for('request_content'))
     return render_template_string(request_html)
 
 @app.route('/wait')
 def wait_page():
-    encoded_target_url = request.args.get('target')
-    if not encoded_target_url: return redirect(url_for('home'))
-    return render_template_string(wait_page_html, target_url=unquote(encoded_target_url))
+    target_url = request.args.get('target')
+    if not target_url: return redirect(url_for('home'))
+    return render_template_string(wait_page_html, target_url=unquote(target_url))
+
+# --- Real-time Link Generation Routes ---
+def run_async_from_sync(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+@app.route('/download/<movie_id>')
+def download_file(movie_id):
+    movie = movies.find_one({"_id": ObjectId(movie_id)}, {"telegram_ref": 1})
+    if not movie or "telegram_ref" not in movie: return "File reference not found.", 404
+    ref = movie["telegram_ref"]
+    fresh_link = run_async_from_sync(generate_fresh_link_async(ref["chat_id"], ref["message_id"]))
+    return redirect(fresh_link) if fresh_link else ("Could not generate download link.", 500)
+
+@app.route('/stream/<movie_id>')
+def stream_page(movie_id):
+    movie = movies.find_one({"_id": ObjectId(movie_id)}, {"telegram_ref": 1, "title": 1, "poster": 1, "backdrop": 1})
+    if not movie or "telegram_ref" not in movie: return "File reference not found.", 404
+    ref = movie["telegram_ref"]
+    stream_link = run_async_from_sync(generate_fresh_link_async(ref["chat_id"], ref["message_id"]))
+    return render_template_string(stream_html, movie=movie, stream_link=stream_link)
 
 # --- ADMIN ROUTES ---
 @app.route('/admin', methods=["GET", "POST"])
@@ -1306,166 +1190,133 @@ def admin():
             ad_data = {f: request.form.get(f) for f in ["ad_header", "ad_body_top", "ad_footer", "ad_list_page", "ad_detail_page", "ad_wait_page"]}
             settings.update_one({"_id": "ad_config"}, {"$set": ad_data}, upsert=True)
         elif form_action == "add_category":
-            category_name = request.form.get("category_name", "").strip()
-            if category_name: categories_collection.update_one({"name": category_name}, {"$set": {"name": category_name}}, upsert=True)
+            if request.form.get("category_name"): categories_collection.update_one({"name": request.form.get("category_name").strip()}, {"$set": {"name": request.form.get("category_name").strip()}}, upsert=True)
         elif form_action == "bulk_delete":
-            ids_to_delete = [ObjectId(id_str) for id_str in request.form.getlist("selected_ids")]
-            if ids_to_delete: movies.delete_many({"_id": {"$in": ids_to_delete}})
+            ids = [ObjectId(id_str) for id_str in request.form.getlist("selected_ids")]
+            if ids: movies.delete_many({"_id": {"$in": ids}})
         elif form_action == "add_content":
-            content_type = request.form.get("content_type", "movie")
             movie_data = {
-                "title": request.form.get("title").strip(), "type": content_type,
-                "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER,
-                "backdrop": request.form.get("backdrop").strip() or None,
-                "overview": request.form.get("overview").strip(),
-                "language": request.form.get("language").strip() or None,
+                "title": request.form.get("title").strip(), "type": request.form.get("content_type", "movie"),
+                "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER, "backdrop": request.form.get("backdrop").strip(),
+                "overview": request.form.get("overview").strip(), "language": request.form.get("language"),
                 "genres": [g.strip() for g in request.form.get("genres", "").split(',') if g.strip()],
-                "categories": request.form.getlist("categories"),
-                "created_at": datetime.utcnow()
+                "categories": request.form.getlist("categories"), "created_at": datetime.utcnow()
             }
-            tmdb_id = request.form.get("tmdb_id")
-            if tmdb_id:
-                tmdb_details = get_tmdb_details(tmdb_id, "tv" if content_type == "series" else "movie")
-                if tmdb_details: movie_data.update({'release_date': tmdb_details.get('release_date'), 'vote_average': tmdb_details.get('vote_average')})
-            
-            # Links processing
-            if content_type == "movie":
-                movie_data["links"] = [{"quality": q, "watch_url": request.form.get(f"watch_link_{q}"), "download_url": request.form.get(f"download_link_{q}")} for q in ["480p", "720p", "1080p"] if request.form.get(f"watch_link_{q}") or request.form.get(f"download_link_{q}")]
-            else:
-                sp_nums, sp_w, sp_d = request.form.getlist('season_pack_number[]'), request.form.getlist('season_pack_watch_link[]'), request.form.getlist('season_pack_download_link[]')
-                movie_data['season_packs'] = [{"season_number": int(sp_nums[i]), "watch_link": sp_w[i].strip() or None, "download_link": sp_d[i].strip() or None} for i in range(len(sp_nums)) if sp_nums[i]]
-                s, n, t, l = request.form.getlist('episode_season[]'), request.form.getlist('episode_number[]'), request.form.getlist('episode_title[]'), request.form.getlist('episode_watch_link[]')
-                movie_data['episodes'] = [{"season": int(s[i]), "episode_number": int(n[i]), "title": t[i].strip(), "watch_link": l[i].strip()} for i in range(len(s)) if s[i] and n[i] and l[i]]
-
+            if request.form.get("tmdb_id"):
+                details = get_tmdb_details(request.form.get("tmdb_id"), "tv" if movie_data["type"] == "series" else "movie")
+                if details: movie_data.update({'release_date': details.get('release_date'), 'vote_average': details.get('vote_average')})
             names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
-            movie_data["manual_links"] = [{"name": names[i].strip(), "url": urls[i].strip()} for i in range(len(names)) if names[i] and urls[i]]
+            movie_data["manual_links"] = [{"name": n.strip(), "url": u.strip()} for n, u in zip(names, urls) if n and u]
             movies.insert_one(movie_data)
         return redirect(url_for('admin'))
     
     search_query = request.args.get('search', '').strip()
     query_filter = {"title": {"$regex": search_query, "$options": "i"}} if search_query else {}
     content_list = list(movies.find(query_filter).sort('_id', -1))
-    
     stats = {
         "total_content": movies.count_documents({}), "total_movies": movies.count_documents({"type": "movie"}),
         "total_series": movies.count_documents({"type": "series"}), "pending_requests": requests_collection.count_documents({"status": "Pending"})
     }
-    
     context = {
         "content_list": content_list, "stats": stats,
-        "requests_list": list(requests_collection.find().sort("created_at", -1)),
+        "requests_list": list(requests_collection.find({"status": "Pending"}).sort("created_at", -1)),
         "categories_list": list(categories_collection.find().sort("name", 1)),
         "ad_settings": settings.find_one({"_id": "ad_config"}) or {}
     }
     return render_template_string(admin_html, **context)
 
+@app.route('/edit_movie/<movie_id>', methods=["GET", "POST"])
+@requires_auth
+def edit_movie(movie_id):
+    obj_id = ObjectId(movie_id)
+    movie_obj = movies.find_one({"_id": obj_id})
+    if not movie_obj: return "Movie not found", 404
+    if request.method == "POST":
+        update_data = {
+            "title": request.form.get("title").strip(),
+            "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER,
+            "backdrop": request.form.get("backdrop").strip(),
+            "overview": request.form.get("overview").strip(),
+            "categories": request.form.getlist("categories")
+        }
+        if "manual_links" in movie_obj:
+             names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
+             update_data["manual_links"] = [{"name": n.strip(), "url": u.strip()} for n, u in zip(names, urls) if n and u]
+        movies.update_one({"_id": obj_id}, {"$set": update_data})
+        return redirect(url_for('admin'))
+    return render_template_string(edit_html, movie=movie_obj, categories_list=list(categories_collection.find().sort("name", 1)))
+
+@app.route('/delete_movie/<movie_id>')
+@requires_auth
+def delete_movie(movie_id):
+    movies.delete_one({"_id": ObjectId(movie_id)})
+    return redirect(url_for('admin'))
+
 @app.route('/admin/category/delete/<cat_id>')
 @requires_auth
 def delete_category(cat_id):
-    try: categories_collection.delete_one({"_id": ObjectId(cat_id)})
-    except: pass
+    categories_collection.delete_one({"_id": ObjectId(cat_id)})
     return redirect(url_for('admin'))
 
 @app.route('/admin/request/update/<req_id>/<status>')
 @requires_auth
 def update_request_status(req_id, status):
-    if status in ['Fulfilled', 'Rejected', 'Pending']:
-        try: requests_collection.update_one({"_id": ObjectId(req_id)}, {"$set": {"status": status}})
-        except: pass
+    if status in ['Fulfilled', 'Rejected']:
+        requests_collection.update_one({"_id": ObjectId(req_id)}, {"$set": {"status": status}})
     return redirect(url_for('admin'))
 
 @app.route('/admin/request/delete/<req_id>')
 @requires_auth
 def delete_request(req_id):
-    try: requests_collection.delete_one({"_id": ObjectId(req_id)})
-    except: pass
-    return redirect(url_for('admin'))
-
-@app.route('/edit_movie/<movie_id>', methods=["GET", "POST"])
-@requires_auth
-def edit_movie(movie_id):
-    try: obj_id = ObjectId(movie_id)
-    except: return "Invalid ID", 400
-    movie_obj = movies.find_one({"_id": obj_id})
-    if not movie_obj: return "Movie not found", 404
-    
-    if request.method == "POST":
-        content_type = request.form.get("content_type")
-        update_data = {
-            "title": request.form.get("title").strip(), "type": content_type, "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER,
-            "backdrop": request.form.get("backdrop").strip() or None, "overview": request.form.get("overview").strip(),
-            "language": request.form.get("language").strip() or None, "genres": [g.strip() for g in request.form.get("genres").split(',') if g.strip()],
-            "categories": request.form.getlist("categories")
-        }
-        names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
-        update_data["manual_links"] = [{"name": names[i].strip(), "url": urls[i].strip()} for i in range(len(names)) if names[i] and urls[i]]
-        
-        if content_type == "movie":
-            update_data["links"] = [{"quality": q, "watch_url": request.form.get(f"watch_link_{q}"), "download_url": request.form.get(f"download_link_{q}")} for q in ["480p", "720p", "1080p"] if request.form.get(f"watch_link_{q}") or request.form.get(f"download_link_{q}")]
-            movies.update_one({"_id": obj_id}, {"$set": update_data, "$unset": {"episodes": "", "season_packs": ""}})
-        else:
-            sp_nums, sp_w, sp_d = request.form.getlist('season_pack_number[]'), request.form.getlist('season_pack_watch_link[]'), request.form.getlist('season_pack_download_link[]')
-            update_data['season_packs'] = [{"season_number": int(sp_nums[i]), "watch_link": sp_w[i].strip() or None, "download_link": sp_d[i].strip() or None} for i in range(len(sp_nums)) if sp_nums[i]]
-            s, n, t, l = request.form.getlist('episode_season[]'), request.form.getlist('episode_number[]'), request.form.getlist('episode_title[]'), request.form.getlist('episode_watch_link[]')
-            update_data["episodes"] = [{"season": int(s[i]), "episode_number": int(n[i]), "title": t[i].strip(), "watch_link": l[i].strip()} for i in range(len(s)) if s[i] and n[i] and l[i]]
-            movies.update_one({"_id": obj_id}, {"$set": update_data, "$unset": {"links": ""}})
-        return redirect(url_for('admin'))
-    
-    categories_list = list(categories_collection.find().sort("name", 1))
-    return render_template_string(edit_html, movie=movie_obj, categories_list=categories_list)
-
-@app.route('/delete_movie/<movie_id>')
-@requires_auth
-def delete_movie(movie_id):
-    try: movies.delete_one({"_id": ObjectId(movie_id)})
-    except: return "Invalid ID", 400
+    requests_collection.delete_one({"_id": ObjectId(req_id)})
     return redirect(url_for('admin'))
 
 # --- API Routes ---
+def get_tmdb_details(tmdb_id, media_type): # Helper for API
+    search_type = "tv" if media_type == "tv" else "movie"
+    try:
+        res = requests.get(f"https://api.themoviedb.org/3/{search_type}/{tmdb_id}?api_key={TMDB_API_KEY}").json()
+        return {
+            "tmdb_id": tmdb_id, "title": res.get("title") or res.get("name"),
+            "poster": f"https://image.tmdb.org/t/p/w500{res.get('poster_path')}",
+            "backdrop": f"https://image.tmdb.org/t/p/w1280{res.get('backdrop_path')}",
+            "overview": res.get("overview"), "release_date": res.get("release_date") or res.get("first_air_date"),
+            "genres": [g['name'] for g in res.get("genres", [])], "vote_average": res.get("vote_average"),
+            "type": "series" if search_type == "tv" else "movie"
+        }
+    except Exception: return None
+
 @app.route('/admin/api/search')
 @requires_auth
 def api_search_tmdb():
     query = request.args.get('query')
-    if not query: return jsonify({"error": "Query parameter is missing"}), 400
-    try:
-        search_url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote(query)}"
-        res = requests.get(search_url, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        results = [
-            {"id": item.get('id'), "title": item.get('title') or item.get('name'),
-             "year": (item.get('release_date') or item.get('first_air_date', 'N/A')).split('-')[0],
-             "poster": f"https://image.tmdb.org/t/p/w200{item.get('poster_path')}",
-             "media_type": item.get('media_type')}
-            for item in data.get('results', []) if item.get('media_type') in ['movie', 'tv'] and item.get('poster_path')
-        ]
-        return jsonify(results)
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    res = requests.get(f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote(query)}").json()
+    results = [
+        {"id": i.get('id'), "title": i.get('title') or i.get('name'),
+         "year": (i.get('release_date') or i.get('first_air_date', 'N/A')).split('-')[0],
+         "poster": f"https://image.tmdb.org/t/p/w200{i.get('poster_path')}", "media_type": i.get('media_type')}
+        for i in res.get('results', []) if i.get('media_type') in ['movie', 'tv'] and i.get('poster_path')
+    ]
+    return jsonify(results)
 
 @app.route('/admin/api/details')
 @requires_auth
 def api_get_details():
-    tmdb_id, media_type = request.args.get('id'), request.args.get('type')
-    if not tmdb_id or not media_type: return jsonify({"error": "ID and type are required"}), 400
-    details = get_tmdb_details(tmdb_id, media_type)
-    return jsonify(details) if details else (jsonify({"error": "Details not found"}), 404)
+    details = get_tmdb_details(request.args.get('id'), request.args.get('type'))
+    return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
 
 @app.route('/api/search')
 def api_search():
     query = request.args.get('q', '').strip()
     if not query: return jsonify([])
-    try:
-        results = list(movies.find({"title": {"$regex": query, "$options": "i"}}, {"_id": 1, "title": 1, "poster": 1}).limit(10))
-        for item in results: item['_id'] = str(item['_id'])
-        return jsonify(results)
-    except Exception as e:
-        print(f"API Search Error: {e}")
-        return jsonify({"error": "An error occurred"}), 500
+    results = list(movies.find({"title": {"$regex": query, "$options": "i"}}, {"_id": 1, "title": 1, "poster": 1}).limit(10))
+    for item in results: item['_id'] = str(item['_id'])
+    return jsonify(results)
 
 # =======================================================================================
-# === [START] MAIN EXECUTION BLOCK ======================================================
+# === MAIN EXECUTION BLOCK ==============================================================
 # =======================================================================================
 if __name__ == "__main__":
     start_telegram_bot()
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)
