@@ -104,46 +104,53 @@ except Exception as e:
 def parse_filename(filename):
     """
     Cleans and parses a filename to extract the movie title and year more flexibly.
+    Includes error handling to prevent crashes.
     """
-    clean_name = os.path.splitext(filename)[0]
-    clean_name = re.sub(r'[\._\-\[]', ' ', clean_name)
-    
-    year_match = re.search(r'[\(\[]?(\d{4})[\)\]]?', clean_name)
-    year = None
-    if year_match:
-        found_year = int(year_match.group(1))
-        current_year = datetime.now().year
-        if 1900 <= found_year <= current_year + 2:
-            year = str(found_year)
-            clean_name = clean_name.replace(year_match.group(0), '')
-
-    tags_to_remove = [
-        '1080p', '720p', '480p', '2160p', '4k', 'uhd', 'hd', 'fhd',
-        'web-dl', 'webrip', 'web', 'hdtv', 'hdrip', 'bluray', 'bdrip', 'dvdrip',
-        'x264', 'x265', 'h264', 'h265', 'avc', 'hevc',
-        'aac', 'ac3', 'dts', 'atmos', '5.1', '7.1',
-        'dual audio', 'hindi', 'english', 'bengali', 'tamil', 'telugu', 'dubbed',
-        'esub', 'msub',
-    ]
-    # Remove content in brackets that often contains channel names or junk
-    clean_name = re.sub(r'\[.*?\]', '', clean_name)
-    
-    # Remove tags using word boundaries
-    for tag in tags_to_remove:
-        clean_name = re.sub(r'\b' + tag + r'\b', '', clean_name, flags=re.IGNORECASE)
-
-    title = re.sub(r'\s+', ' ', clean_name).strip()
-    
-    if not title:
-        return None, None
+    try:
+        clean_name = os.path.splitext(filename)[0]
+        clean_name = re.sub(r'[\._\-\[]', ' ', clean_name)
         
-    return title, year
+        year_match = re.search(r'[\(\[]?(\d{4})[\)\]]?', clean_name)
+        year = None
+        if year_match:
+            found_year = int(year_match.group(1))
+            current_year = datetime.now().year
+            if 1900 <= found_year <= current_year + 2:
+                year = str(found_year)
+                clean_name = clean_name.replace(year_match.group(0), '')
+
+        tags_to_remove = [
+            '1080p', '720p', '480p', '2160p', '4k', 'uhd', 'hd', 'fhd',
+            'web-dl', 'webrip', 'web', 'hdtv', 'hdrip', 'bluray', 'bdrip', 'dvdrip',
+            'x264', 'x265', 'h264', 'h265', 'avc', 'hevc',
+            'aac', 'ac3', 'dts', 'atmos', '5.1', '7.1',
+            'dual audio', 'hindi', 'english', 'bengali', 'tamil', 'telugu', 'dubbed',
+            'esub', 'msub',
+        ]
+        
+        clean_name = re.sub(r'\[.*?\]', '', clean_name)
+        
+        for tag in tags_to_remove:
+            clean_name = re.sub(r'\b' + tag + r'\b', '', clean_name, flags=re.IGNORECASE)
+
+        title = re.sub(r'\s+', ' ', clean_name).strip()
+        
+        if not title:
+            return None, None
+            
+        return title, year
+    except Exception as e:
+        print(f"ERROR in parse_filename for '{filename}': {e}")
+        # Fallback to the original simple parser
+        match = re.search(r'^(.*?)\s*\((\d{4})\)', filename)
+        if match:
+            title = match.group(1).strip().replace('.', ' ').replace('_', ' ')
+            year = match.group(2)
+            return title, year
+        return None, None
+
 
 def search_tmdb_for_bot(title, year):
-    """
-    Searches TMDB for a movie or series, with or without a year.
-    Retries without year if the initial search fails.
-    """
     base_url = "https://api.themoviedb.org/3/search/multi"
     params = {"api_key": TMDB_API_KEY, "query": quote(title)}
     
@@ -183,35 +190,38 @@ def search_tmdb_for_bot(title, year):
         return None
 
 def handle_new_post(update):
-    message = update.channel_post
-    if not message or message.chat_id != TARGET_CHANNEL_ID: return
-    
-    file = message.video or message.document
-    if not file or not file.file_name: return
-    
-    title, year = parse_filename(file.file_name)
-    if not title:
-        bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Could not extract a valid movie title from the filename.", reply_to_message_id=message.message_id, parse_mode='Markdown')
-        return
-
-    tmdb_details = search_tmdb_for_bot(title, year)
-    if not tmdb_details:
-        bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not find `{title}` on TMDB.", reply_to_message_id=message.message_id, parse_mode='Markdown')
-        return
-    
-    movie_data = {
-        "title": tmdb_details["title"], "type": tmdb_details["type"], "poster": tmdb_details["poster"] or PLACEHOLDER_POSTER,
-        "backdrop": tmdb_details["backdrop"], "overview": tmdb_details["overview"], "release_date": tmdb_details["release_date"],
-        "genres": tmdb_details["genres"], "vote_average": tmdb_details["vote_average"], "created_at": datetime.utcnow(),
-        "telegram_ref": {"chat_id": message.chat_id, "message_id": message.message_id}
-    }
-    
     try:
-        result = movies.insert_one(movie_data)
-        post_url = f"{WEBSITE_URL}/movie/{result.inserted_id}"
-        bot.send_message(chat_id=message.chat_id, text=f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", reply_to_message_id=message.message_id, disable_web_page_preview=True)
+        message = update.channel_post
+        if not message or message.chat_id != TARGET_CHANNEL_ID: return
+        
+        file = message.video or message.document
+        if not file or not file.file_name: return
+        
+        title, year = parse_filename(file.file_name)
+        if not title:
+            bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Could not extract a valid movie title from the filename.", reply_to_message_id=message.message_id, parse_mode='Markdown')
+            return
+
+        tmdb_details = search_tmdb_for_bot(title, year)
+        if not tmdb_details:
+            bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not find `{title}` on TMDB.", reply_to_message_id=message.message_id, parse_mode='Markdown')
+            return
+        
+        movie_data = {
+            "title": tmdb_details["title"], "type": tmdb_details["type"], "poster": tmdb_details["poster"] or PLACEHOLDER_POSTER,
+            "backdrop": tmdb_details["backdrop"], "overview": tmdb_details["overview"], "release_date": tmdb_details["release_date"],
+            "genres": tmdb_details["genres"], "vote_average": tmdb_details["vote_average"], "created_at": datetime.utcnow(),
+            "telegram_ref": {"chat_id": message.chat_id, "message_id": message.message_id}
+        }
+        
+        try:
+            result = movies.insert_one(movie_data)
+            post_url = f"{WEBSITE_URL}/movie/{result.inserted_id}"
+            bot.send_message(chat_id=message.chat_id, text=f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", reply_to_message_id=message.message_id, disable_web_page_preview=True)
+        except Exception as e:
+            bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not post to database. Details: {e}", reply_to_message_id=message.message_id)
     except Exception as e:
-        bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not post to database. Details: {e}", reply_to_message_id=message.message_id)
+        print(f"CRITICAL ERROR in handle_new_post: {e}")
 
 async def generate_fresh_link_async(chat_id, msg_id):
     if not pyro_bot.is_initialized:
@@ -249,7 +259,7 @@ app.jinja_env.filters['time_ago'] = time_ago
 def inject_globals():
     ad_settings = settings.find_one({"_id": "ad_config"}) or {}
     all_categories = [cat['name'] for cat in categories_collection.find().sort("name", 1)]
-    return dict(website_name=WEBSITE_NAME, ad_settings=ad_settings, predefined_categories=all_categories, quote=quote)
+    return dict(website_name=WEBSITE_NAME, ad_settings=ad_settings, predefined_categories=all_categories, quote=quote, current_year=datetime.utcnow().year)
 
 # =========================================================================================
 # === [START] HTML TEMPLATES ============================================================
@@ -494,7 +504,7 @@ index_html = """
   {% endif %}
 </main>
 <footer class="main-footer">
-    <p>&copy; {{ "now" | date("%Y") }} {{ website_name }}. All Rights Reserved.</p>
+    <p>&copy; {{ current_year }} {{ website_name }}. All Rights Reserved.</p>
 </footer>
 <nav class="bottom-nav">
   <a href="{{ url_for('home') }}" class="nav-item active"><i class="fas fa-home"></i><span>Home</span></a>
@@ -612,6 +622,8 @@ detail_html = """
   .movie-poster { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 8px; margin-bottom: 10px; }
   .card-title { font-size: 0.9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .swiper-button-next, .swiper-button-prev { color: var(--text-light); display: none; }
+  .ad-container { margin: 20px auto; width: 100%; max-width: 100%; display: flex; justify-content: center; align-items: center; overflow: hidden; min-height: 50px; text-align: center; }
+  .ad-container > * { max-width: 100% !important; }
   @media (min-width: 768px) {
     .container { padding: 0 40px; }
     .detail-content { flex-direction: row; text-align: left; }
@@ -643,7 +655,7 @@ detail_html = """
     </div>
 </div>
 <div class="container">
-    {% if ad_settings.ad_detail_page %}<div class="ad-container" style="margin: 20px auto;">{{ ad_settings.ad_detail_page | safe }}</div>{% endif %}
+    {% if ad_settings.ad_detail_page %}<div class="ad-container">{{ ad_settings.ad_detail_page | safe }}</div>{% endif %}
     <div class="tabs-container">
         <nav class="tabs-nav">
             <div class="tab-link active" data-tab="downloads"><i class="fas fa-download"></i> Links</div>
@@ -914,7 +926,6 @@ admin_html = """
         .result-item img { width: 100%; aspect-ratio: 2/3; object-fit: cover; border-radius: 5px; margin-bottom: 10px; border: 2px solid transparent; transition: all 0.2s; }
         .result-item:hover img { transform: scale(1.05); border-color: var(--netflix-red); }
         .result-item p { font-size: 0.9rem; }
-        .season-pack-item { display: grid; grid-template-columns: 100px 1fr 1fr; gap: 10px; align-items: flex-end; }
         .manage-content-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px; margin-bottom: 20px; }
         .search-form { display: flex; gap: 10px; flex-grow: 1; max-width: 500px; }
         .search-form input { flex-grow: 1; }
@@ -1014,7 +1025,7 @@ admin_html = """
             <div class="form-group"><label>Language:</label><input type="text" name="language" id="language" placeholder="e.g., Hindi"></div>
             <div class="form-group"><label>Genres (comma-separated):</label><input type="text" name="genres" id="genres"></div>
             <div class="form-group"><label>Categories:</label><div class="checkbox-group">{% for cat in categories_list %}<label><input type="checkbox" name="categories" value="{{ cat.name }}"> {{ cat.name }}</label>{% endfor %}</div></div>
-            <div class="form-group"><label>Content Type:</label><select name="content_type" id="content_type" onchange="toggleFields()"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+            <div class="form-group"><label>Content Type:</label><select name="content_type" id="content_type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
         </fieldset>
         <fieldset id="manual_links_fieldset"><legend>Manual Download Buttons</legend><div id="manual_links_container"></div><button type="button" onclick="addManualLinkField()" class="btn btn-secondary"><i class="fas fa-plus"></i> Add Manual Button</button></fieldset>
         <button type="submit" class="btn btn-primary"><i class="fas fa-check"></i> Add Content</button>
