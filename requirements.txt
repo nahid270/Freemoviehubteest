@@ -1,5 +1,8 @@
 Flask
-requests
 pymongo
-APScheduler
+requests
+python-dotenv
+python-telegram-bot==13.15
+Pyrogram
+tgcrypto
 gunicorn
