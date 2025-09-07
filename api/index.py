@@ -55,7 +55,6 @@ app = Flask(__name__)
 
 # --- Telegram Bot & Pyrogram Client Initialization ---
 bot = Bot(token=BOT_TOKEN)
-# Pyrogram ক্লায়েন্ট সেশন স্ট্রিং দিয়ে মেমোরিতে চালু হবে, কোনো ফাইল তৈরি করবে না
 pyro_bot = Client(":memory:", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=PYROGRAM_SESSION)
 
 # --- Authentication ---
@@ -100,24 +99,74 @@ except Exception as e:
     sys.exit(1)
 
 # =========================================================================================
-# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC ======================================
+# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC (WITH SMART PARSING) ===============
 # =========================================================================================
 def parse_filename(filename):
-    match = re.search(r'^(.*?)\s*\((\d{4})\)', filename)
-    if match:
-        title = match.group(1).strip().replace('.', ' ').replace('_', ' ')
-        year = match.group(2)
-        return title, year
-    return None, None
+    """
+    Cleans and parses a filename to extract the movie title and year more flexibly.
+    """
+    clean_name = os.path.splitext(filename)[0]
+    clean_name = re.sub(r'[\._\-\[]', ' ', clean_name)
+    
+    year_match = re.search(r'[\(\[]?(\d{4})[\)\]]?', clean_name)
+    year = None
+    if year_match:
+        found_year = int(year_match.group(1))
+        current_year = datetime.now().year
+        if 1900 <= found_year <= current_year + 2:
+            year = str(found_year)
+            clean_name = clean_name.replace(year_match.group(0), '')
+
+    tags_to_remove = [
+        '1080p', '720p', '480p', '2160p', '4k', 'uhd', 'hd', 'fhd',
+        'web-dl', 'webrip', 'web', 'hdtv', 'hdrip', 'bluray', 'bdrip', 'dvdrip',
+        'x264', 'x265', 'h264', 'h265', 'avc', 'hevc',
+        'aac', 'ac3', 'dts', 'atmos', '5.1', '7.1',
+        'dual audio', 'hindi', 'english', 'bengali', 'tamil', 'telugu', 'dubbed',
+        'esub', 'msub',
+    ]
+    # Remove content in brackets that often contains channel names or junk
+    clean_name = re.sub(r'\[.*?\]', '', clean_name)
+    
+    # Remove tags using word boundaries
+    for tag in tags_to_remove:
+        clean_name = re.sub(r'\b' + tag + r'\b', '', clean_name, flags=re.IGNORECASE)
+
+    title = re.sub(r'\s+', ' ', clean_name).strip()
+    
+    if not title:
+        return None, None
+        
+    return title, year
 
 def search_tmdb_for_bot(title, year):
-    search_url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote(title)}&year={year}"
+    """
+    Searches TMDB for a movie or series, with or without a year.
+    Retries without year if the initial search fails.
+    """
+    base_url = "https://api.themoviedb.org/3/search/multi"
+    params = {"api_key": TMDB_API_KEY, "query": quote(title)}
+    
+    if year:
+        params["year"] = year
+    
+    search_url = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+    
     try:
         response = requests.get(search_url, timeout=10)
         response.raise_for_status()
         results = response.json().get('results', [])
+        
+        if not results and year:
+            print(f"No results for '{title}' with year {year}. Retrying without year.")
+            params.pop("year")
+            search_url_no_year = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+            response = requests.get(search_url_no_year, timeout=10)
+            results = response.json().get('results', [])
+
         first_result = next((r for r in results if r.get('media_type') in ['movie', 'tv']), None)
         if not first_result: return None
+        
         media_type, tmdb_id = first_result['media_type'], first_result['id']
         detail_url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
         data = requests.get(detail_url, timeout=10).json()
@@ -142,12 +191,12 @@ def handle_new_post(update):
     
     title, year = parse_filename(file.file_name)
     if not title:
-        bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Filename format is incorrect. Use `Movie Name (Year).mkv`", reply_to_message_id=message.message_id, parse_mode='Markdown')
+        bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Could not extract a valid movie title from the filename.", reply_to_message_id=message.message_id, parse_mode='Markdown')
         return
 
     tmdb_details = search_tmdb_for_bot(title, year)
     if not tmdb_details:
-        bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not find `{title} ({year})` on TMDB.", reply_to_message_id=message.message_id, parse_mode='Markdown')
+        bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not find `{title}` on TMDB.", reply_to_message_id=message.message_id, parse_mode='Markdown')
         return
     
     movie_data = {
@@ -165,7 +214,6 @@ def handle_new_post(update):
         bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not post to database. Details: {e}", reply_to_message_id=message.message_id)
 
 async def generate_fresh_link_async(chat_id, msg_id):
-    """Generates a fresh, temporary download link from Telegram."""
     if not pyro_bot.is_initialized:
         await pyro_bot.start()
     try:
@@ -183,30 +231,25 @@ async def generate_fresh_link_async(chat_id, msg_id):
             print(f"LINKGEN FORWARD-RETRY FAILED for {chat_id}/{msg_id}: {e2}")
             return None
 
-# --- Custom Jinja Filter for Relative Time ---
+# --- Custom Jinja Filter & Context Processor ---
 def time_ago(obj_id):
     if not isinstance(obj_id, ObjectId): return ""
-    post_time = obj_id.generation_time.replace(tzinfo=None)
-    now = datetime.utcnow()
-    diff = now - post_time
+    diff = datetime.utcnow() - obj_id.generation_time.replace(tzinfo=None)
     seconds = diff.total_seconds()
     if seconds < 60: return "just now"
-    elif seconds < 3600:
-        minutes = int(seconds / 60)
-        return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
-    elif seconds < 86400:
-        hours = int(seconds / 3600)
-        return f"{hours} hour{'s' if hours > 1 else ''} ago"
-    else:
-        days = int(seconds / 86400)
-        return f"{days} day{'s' if days > 1 else ''} ago"
+    minutes = int(seconds / 60)
+    if minutes < 60: return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+    hours = int(minutes / 60)
+    if hours < 24: return f"{hours} hour{'s' if hours > 1 else ''} ago"
+    days = int(hours / 24)
+    return f"{days} day{'s' if days > 1 else ''} ago"
 app.jinja_env.filters['time_ago'] = time_ago
 
 @app.context_processor
 def inject_globals():
-    ad_settings = settings.find_one({"_id": "ad_config"})
+    ad_settings = settings.find_one({"_id": "ad_config"}) or {}
     all_categories = [cat['name'] for cat in categories_collection.find().sort("name", 1)]
-    return dict(website_name=WEBSITE_NAME, ad_settings=ad_settings or {}, predefined_categories=all_categories, quote=quote)
+    return dict(website_name=WEBSITE_NAME, ad_settings=ad_settings, predefined_categories=all_categories, quote=quote)
 
 # =========================================================================================
 # === [START] HTML TEMPLATES ============================================================
@@ -451,7 +494,7 @@ index_html = """
   {% endif %}
 </main>
 <footer class="main-footer">
-    <p>&copy; 2024 {{ website_name }}. All Rights Reserved.</p>
+    <p>&copy; {{ "now" | date("%Y") }} {{ website_name }}. All Rights Reserved.</p>
 </footer>
 <nav class="bottom-nav">
   <a href="{{ url_for('home') }}" class="nav-item active"><i class="fas fa-home"></i><span>Home</span></a>
@@ -562,9 +605,6 @@ detail_html = """
   .link-group:last-child { border-bottom: none; }
   .link-group h3 { font-size: 1.2rem; font-weight: 500; margin-bottom: 20px; }
   .link-buttons { display: inline-flex; flex-wrap: wrap; gap: 15px; justify-content: center;}
-  .episode-list { display: flex; flex-direction: column; gap: 10px; }
-  .episode-item { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; background-color: var(--card-bg); padding: 15px; border-radius: 8px; }
-  .episode-name { font-weight: 500; }
   .category-section { margin: 50px 0; }
   .category-title { font-size: 1.5rem; font-weight: 600; }
   .movie-carousel .swiper-slide { width: 150px; }
@@ -579,7 +619,6 @@ detail_html = """
     .detail-title { font-size: 3rem; }
     .detail-meta { justify-content: flex-start; }
     .tabs-nav { justify-content: flex-start; }
-    .episode-item { flex-direction: row; justify-content: space-between; align-items: center; }
     .movie-carousel .swiper-slide { width: 220px; }
     .swiper-button-next, .swiper-button-prev { display: flex; }
   }
@@ -604,6 +643,7 @@ detail_html = """
     </div>
 </div>
 <div class="container">
+    {% if ad_settings.ad_detail_page %}<div class="ad-container" style="margin: 20px auto;">{{ ad_settings.ad_detail_page | safe }}</div>{% endif %}
     <div class="tabs-container">
         <nav class="tabs-nav">
             <div class="tab-link active" data-tab="downloads"><i class="fas fa-download"></i> Links</div>
@@ -677,7 +717,7 @@ stream_html = """
     <title>Watching: {{ movie.title }} - {{ website_name }}</title>
     <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #000; font-family: 'Poppins', sans-serif; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #000; font-family: sans-serif; }
         .container { width: 100%; height: 100%; }
         .plyr { width: 100%; height: 100%; --plyr-color-main: #E50914; }
     </style>
@@ -702,9 +742,7 @@ stream_html = """
             const video = document.getElementById('player');
             if (video) {
                 const source = video.getElementsByTagName('source')[0].src;
-                const player = new Plyr(video, {
-                    title: '{{ movie.title }}',
-                });
+                const player = new Plyr(video, { title: '{{ movie.title }}' });
                 if (Hls.isSupported() && source.includes('.m3u8')) {
                     const hls = new Hls();
                     hls.loadSource(source);
@@ -737,6 +775,7 @@ wait_page_html = """
         .timer { font-size: 2.5rem; font-weight: 700; color: var(--text-light); margin-bottom: 30px; }
         .get-link-btn { display: inline-block; text-decoration: none; color: white; font-weight: 600; cursor: pointer; border: none; padding: 12px 30px; border-radius: 50px; font-size: 1rem; background-color: #555; transition: background-color 0.2s; }
         .get-link-btn.ready { background-color: var(--primary-color); }
+        .ad-container { margin-top: 20px; }
     </style>
 </head>
 <body>
@@ -1048,16 +1087,16 @@ edit_html = """
         <div class="form-group"><label>Title:</label><input type="text" name="title" value="{{ movie.title }}" required></div>
         <div class="form-group"><label>Poster URL:</label><input type="url" name="poster" value="{{ movie.poster or '' }}"></div>
         <div class="form-group"><label>Backdrop URL:</label><input type="url" name="backdrop" value="{{ movie.backdrop or '' }}"></div>
-        <div class="form-group"><label>Overview:</label><textarea name="overview">{{ movie.overview or '' }}</textarea></div>
+        <div class="form-group"><label>Overview:</label><textarea name="overview" rows="5">{{ movie.overview or '' }}</textarea></div>
         <div class="form-group"><label>Categories:</label><div class="checkbox-group">{% for cat in categories_list %}<label><input type="checkbox" name="categories" value="{{ cat.name }}" {% if movie.categories and cat.name in movie.categories %}checked{% endif %}> {{ cat.name }}</label>{% endfor %}</div></div>
     </fieldset>
-    {% if movie.manual_links %}
+    {% if movie.get('manual_links') is not none %}
     <fieldset><legend>Manual Download Buttons</legend><div id="manual_links_container">
         {% for link in movie.manual_links %}<div class="dynamic-item"><button type="button" onclick="this.parentElement.remove()" class="btn btn-danger">X</button><div class="link-pair"><div class="form-group"><label>Button Name</label><input type="text" name="manual_link_name[]" value="{{ link.name }}" required></div><div class="form-group"><label>Link URL</label><input type="url" name="manual_link_url[]" value="{{ link.url }}" required></div></div></div>{% endfor %}
     </div></button></fieldset>
     {% endif %}
     {% if movie.telegram_ref %}
-    <fieldset><legend>Telegram Source</legend><p>This content is linked from Telegram. Links are generated automatically. To add manual links, please create a new manual entry.</p></fieldset>
+    <fieldset><legend>Telegram Source</legend><p>This content is linked from Telegram. Links are generated automatically.</p></fieldset>
     {% endif %}
     <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Update Content</button>
   </form>
@@ -1068,7 +1107,6 @@ edit_html = """
 # =========================================================================================
 # === [START] FLASK ROUTES ==============================================================
 # =========================================================================================
-# --- Helper Class and Functions ---
 class Pagination:
     def __init__(self, page, per_page, total_count):
         self.page, self.per_page, self.total_count = page, per_page, total_count
@@ -1088,6 +1126,14 @@ def get_paginated_content(query_filter, page):
     total_count = movies.count_documents(query_filter)
     content_list = list(movies.find(query_filter).sort('_id', -1).skip(skip).limit(ITEMS_PER_PAGE))
     return content_list, Pagination(page, ITEMS_PER_PAGE, total_count)
+
+def run_async_from_sync(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 # --- Webhook Routes (For Vercel) ---
 @app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
@@ -1112,10 +1158,10 @@ def set_webhook():
 def home():
     query = request.args.get('q', '').strip()
     if query:
-        movies_list, _ = get_paginated_content({"title": {"$regex": query, "$options": "i"}}, 1)
-        return render_template_string(index_html, movies=movies_list, query=f'Results for "{query}"', is_full_page_list=True)
+        movies_list, pagination = get_paginated_content({"title": {"$regex": query, "$options": "i"}}, 1)
+        return render_template_string(index_html, movies=movies_list, query=f'Results for "{query}"', is_full_page_list=True, pagination=pagination)
     
-    slider_content = list(movies.find({}).sort('_id', -1).limit(15))
+    slider_content = list(movies.find({}).sort('_id', -1).limit(10))
     home_categories = [cat['name'] for cat in categories_collection.find().sort("name", 1)]
     categorized_content = {cat: list(movies.find({"categories": cat}).sort('_id', -1).limit(10)) for cat in home_categories}
     latest_content = list(movies.find().sort('_id', -1).limit(10))
@@ -1156,27 +1202,17 @@ def movies_by_category():
 
 @app.route('/request', methods=['GET', 'POST'])
 def request_content():
-    if request.method == 'POST':
-        if request.form.get('content_name'):
-            requests_collection.insert_one({"name": request.form.get('content_name').strip(), "info": request.form.get('extra_info', '').strip(), "status": "Pending", "created_at": datetime.utcnow()})
+    if request.method == 'POST' and request.form.get('content_name'):
+        requests_collection.insert_one({"name": request.form.get('content_name').strip(), "info": request.form.get('extra_info', '').strip(), "status": "Pending", "created_at": datetime.utcnow()})
         return redirect(url_for('request_content'))
     return render_template_string(request_html)
 
 @app.route('/wait')
 def wait_page():
     target_url = request.args.get('target')
-    if not target_url: return redirect(url_for('home'))
-    return render_template_string(wait_page_html, target_url=unquote(target_url))
+    return render_template_string(wait_page_html, target_url=unquote(target_url)) if target_url else redirect(url_for('home'))
 
 # --- Real-time Link Generation Routes ---
-def run_async_from_sync(coro):
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
-
 @app.route('/download/<movie_id>')
 def download_file(movie_id):
     movie = movies.find_one({"_id": ObjectId(movie_id)}, {"telegram_ref": 1})
@@ -1218,8 +1254,10 @@ def admin():
             if request.form.get("tmdb_id"):
                 details = get_tmdb_details(request.form.get("tmdb_id"), "tv" if movie_data["type"] == "series" else "movie")
                 if details: movie_data.update({'release_date': details.get('release_date'), 'vote_average': details.get('vote_average')})
-            names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
-            movie_data["manual_links"] = [{"name": n.strip(), "url": u.strip()} for n, u in zip(names, urls) if n and u]
+            names = request.form.getlist('manual_link_name[]')
+            urls = request.form.getlist('manual_link_url[]')
+            if names and urls:
+                movie_data["manual_links"] = [{"name": n.strip(), "url": u.strip()} for n, u in zip(names, urls) if n and u]
             movies.insert_one(movie_data)
         return redirect(url_for('admin'))
     
@@ -1252,7 +1290,7 @@ def edit_movie(movie_id):
             "overview": request.form.get("overview").strip(),
             "categories": request.form.getlist("categories")
         }
-        if "manual_links" in movie_obj:
+        if movie_obj.get('manual_links') is not None:
              names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
              update_data["manual_links"] = [{"name": n.strip(), "url": u.strip()} for n, u in zip(names, urls) if n and u]
         movies.update_one({"_id": obj_id}, {"$set": update_data})
@@ -1285,7 +1323,7 @@ def delete_request(req_id):
     return redirect(url_for('admin'))
 
 # --- API Routes ---
-def get_tmdb_details(tmdb_id, media_type): # Helper for API
+def get_tmdb_details(tmdb_id, media_type):
     search_type = "tv" if media_type == "tv" else "movie"
     try:
         res = requests.get(f"https://api.themoviedb.org/3/{search_type}/{tmdb_id}?api_key={TMDB_API_KEY}").json()
