@@ -5,19 +5,18 @@ import os
 import sys
 import requests
 import re
-import threading
-import math
 import asyncio
+import math
 from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from functools import wraps
 from urllib.parse import unquote, quote
-from datetime import datetime, time
+from datetime import datetime
 from dotenv import load_dotenv
 
 # --- Telegram Imports ---
-from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
+from telegram import Bot, Update
 from pyrogram import Client
 
 # Load environment variables from .env file
@@ -29,27 +28,35 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "password")
 WEBSITE_NAME = os.environ.get("WEBSITE_NAME", "MovieSite")
-WEBSITE_URL = os.environ.get("WEBSITE_URL", "http://127.0.0.1:5000")
+WEBSITE_URL = os.environ.get("WEBSITE_URL") 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID")
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
+PYROGRAM_SESSION = os.environ.get("PYROGRAM_SESSION")
 
 # --- Validate Environment Variables ---
-if not all([MONGO_URI, TMDB_API_KEY, API_ID, API_HASH, BOT_TOKEN]):
-    print("FATAL: One or more required environment variables are missing.")
+required_vars = ["MONGO_URI", "TMDB_API_KEY", "API_ID", "API_HASH", "BOT_TOKEN", "PYROGRAM_SESSION", "WEBSITE_URL"]
+missing_vars = [var for var in required_vars if not globals().get(var)]
+if missing_vars:
+    print(f"FATAL: Missing required environment variables: {', '.join(missing_vars)}")
     sys.exit(1)
+
 try:
     TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID)
 except (ValueError, TypeError):
-    print("WARNING: TARGET_CHANNEL_ID is invalid. Bot will not start.")
-    BOT_TOKEN = None
+    print("WARNING: TARGET_CHANNEL_ID is invalid or missing. Bot may not function correctly.")
+    TARGET_CHANNEL_ID = None
 
-# --- App Initialization & Pyrogram Client ---
+# --- App Initialization ---
 PLACEHOLDER_POSTER = "https://via.placeholder.com/400x600.png?text=Poster+Not+Found"
 ITEMS_PER_PAGE = 20
 app = Flask(__name__)
-pyro_bot = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- Telegram Bot & Pyrogram Client Initialization ---
+bot = Bot(token=BOT_TOKEN)
+# Pyrogram ক্লায়েন্ট সেশন স্ট্রিং দিয়ে মেমোরিতে চালু হবে, কোনো ফাইল তৈরি করবে না
+pyro_bot = Client(":memory:", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=PYROGRAM_SESSION)
 
 # --- Authentication ---
 def check_auth(username, password):
@@ -126,19 +133,21 @@ def search_tmdb_for_bot(title, year):
         print(f"BOT ERROR: TMDB API request failed: {e}")
         return None
 
-def handle_new_post(update, context):
+def handle_new_post(update):
     message = update.channel_post
-    if message.chat_id != TARGET_CHANNEL_ID: return
+    if not message or message.chat_id != TARGET_CHANNEL_ID: return
+    
     file = message.video or message.document
     if not file or not file.file_name: return
     
     title, year = parse_filename(file.file_name)
     if not title:
-        message.reply_text("⚠️ **Error:** Filename format is incorrect. Use `Movie Name (Year).mkv`", parse_mode='Markdown')
+        bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Filename format is incorrect. Use `Movie Name (Year).mkv`", reply_to_message_id=message.message_id, parse_mode='Markdown')
         return
+
     tmdb_details = search_tmdb_for_bot(title, year)
     if not tmdb_details:
-        message.reply_text(f"⚠️ **Error:** Could not find `{title} ({year})` on TMDB.", parse_mode='Markdown')
+        bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not find `{title} ({year})` on TMDB.", reply_to_message_id=message.message_id, parse_mode='Markdown')
         return
     
     movie_data = {
@@ -151,42 +160,28 @@ def handle_new_post(update, context):
     try:
         result = movies.insert_one(movie_data)
         post_url = f"{WEBSITE_URL}/movie/{result.inserted_id}"
-        message.reply_text(f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", disable_web_page_preview=True)
+        bot.send_message(chat_id=message.chat_id, text=f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", reply_to_message_id=message.message_id, disable_web_page_preview=True)
     except Exception as e:
-        message.reply_text(f"⚠️ **Error:** Could not post to database. Details: {e}")
+        bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not post to database. Details: {e}", reply_to_message_id=message.message_id)
 
 async def generate_fresh_link_async(chat_id, msg_id):
     """Generates a fresh, temporary download link from Telegram."""
-    if not pyro_bot.is_connected:
+    if not pyro_bot.is_initialized:
         await pyro_bot.start()
     try:
-        # A robust way to get a downloadable message is to forward it.
-        # Forwarding to "me" (Saved Messages) is a safe bet.
-        forwarded_message = await pyro_bot.forward_messages(
-            chat_id="me",
-            from_chat_id=chat_id,
-            message_ids=msg_id
-        )
-        # Now, get the download link from the forwarded message
-        # The download() method with in_memory=True is a trick to get the URL without saving the file
-        link = await forwarded_message.download(in_memory=True)
-        # Clean up by deleting the forwarded message from "Saved Messages"
-        await forwarded_message.delete()
+        link = await pyro_bot.get_download_link(chat_id, msg_id)
         return link
     except Exception as e:
         print(f"LINKGEN ERROR for {chat_id}/{msg_id}: {e}")
-        return None
-
-def start_telegram_bot():
-    if BOT_TOKEN:
-        updater = Updater(BOT_TOKEN, use_context=True)
-        dispatcher = updater.dispatcher
-        dispatcher.add_handler(MessageHandler(Filters.update.channel_posts & (Filters.video | Filters.document), handle_new_post, run_async=True))
-        
-        # Run polling and pyrogram client in separate threads
-        threading.Thread(target=updater.start_polling, daemon=True).start()
-        threading.Thread(target=pyro_bot.run, daemon=True).start()
-        print("SUCCESS: Telegram bot (poller & link generator) is running.")
+        try:
+            print("Retrying link generation with forwarding method...")
+            forwarded_message = await pyro_bot.forward_messages(chat_id="me", from_chat_id=chat_id, message_ids=msg_id)
+            link = await forwarded_message.download(in_memory=True)
+            await forwarded_message.delete()
+            return link
+        except Exception as e2:
+            print(f"LINKGEN FORWARD-RETRY FAILED for {chat_id}/{msg_id}: {e2}")
+            return None
 
 # --- Custom Jinja Filter for Relative Time ---
 def time_ago(obj_id):
@@ -1070,10 +1065,10 @@ edit_html = """
 </body></html>
 """
 
-# =======================================================================================
+# =========================================================================================
 # === [START] FLASK ROUTES ==============================================================
-# =======================================================================================
-# --- Helper Class ---
+# =========================================================================================
+# --- Helper Class and Functions ---
 class Pagination:
     def __init__(self, page, per_page, total_count):
         self.page, self.per_page, self.total_count = page, per_page, total_count
@@ -1093,6 +1088,24 @@ def get_paginated_content(query_filter, page):
     total_count = movies.count_documents(query_filter)
     content_list = list(movies.find(query_filter).sort('_id', -1).skip(skip).limit(ITEMS_PER_PAGE))
     return content_list, Pagination(page, ITEMS_PER_PAGE, total_count)
+
+# --- Webhook Routes (For Vercel) ---
+@app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
+def webhook_handler():
+    if request.is_json:
+        update = Update.de_json(request.get_json(force=True), bot)
+        handle_new_post(update)
+    return 'ok', 200
+
+@app.route('/set_webhook')
+@requires_auth
+def set_webhook():
+    webhook_url = f'{WEBSITE_URL.rstrip("/")}/webhook/{BOT_TOKEN}'
+    try:
+        is_set = bot.set_webhook(url=webhook_url)
+        return f"Webhook successfully set to: {webhook_url}", 200 if is_set else ("Failed to set webhook.", 500)
+    except Exception as e:
+        return f"Error setting webhook: {e}", 500
 
 # --- Public Routes ---
 @app.route('/')
@@ -1117,7 +1130,7 @@ def movie_detail(movie_id):
         if movie.get('type'):
             related_content = list(movies.find({"type": movie['type'], "_id": {"$ne": movie['_id']}}).sort('_id', -1).limit(10))
         return render_template_string(detail_html, movie=movie, related_content=related_content)
-    except Exception:
+    except:
         return "Content not found", 404
 
 @app.route('/movies')
@@ -1314,9 +1327,8 @@ def api_search():
     return jsonify(results)
 
 # =======================================================================================
-# === MAIN EXECUTION BLOCK ==============================================================
+# === MAIN EXECUTION BLOCK (For local testing) ==========================================
 # =======================================================================================
 if __name__ == "__main__":
-    start_telegram_bot()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, threaded=True)
