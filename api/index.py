@@ -7,6 +7,7 @@ import requests
 import re
 import asyncio
 import math
+import traceback
 from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
@@ -53,9 +54,10 @@ PLACEHOLDER_POSTER = "https://via.placeholder.com/400x600.png?text=Poster+Not+Fo
 ITEMS_PER_PAGE = 20
 app = Flask(__name__)
 
-# --- Telegram Bot & Pyrogram Client Initialization ---
+# --- Telegram Bot Initialization (for messaging) ---
 bot = Bot(token=BOT_TOKEN)
-pyro_bot = Client(":memory:", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=PYROGRAM_SESSION)
+
+# --- NOTE: Pyrogram Client is now initialized on-demand inside generate_fresh_link_async ---
 
 # --- Authentication ---
 def check_auth(username, password):
@@ -99,29 +101,18 @@ except Exception as e:
     sys.exit(1)
 
 # =========================================================================================
-# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC (FINAL ADVANCED PARSING) ============
+# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC (ON-DEMAND CLIENT) ===================
 # =========================================================================================
 def parse_filename(filename):
-    """
-    Cleans and parses a filename to extract title and year,
-    with improved handling for series names and release group tags.
-    """
     try:
         clean_name = os.path.splitext(filename)[0]
-        
-        # Replace common delimiters with spaces
         clean_name = re.sub(r'[\._\-\[\]\(\)]', ' ', clean_name)
-        
-        # Aggressively remove release group from the very end (e.g., -Telly)
         clean_name = re.sub(r'\s-\s?\w+$', '', clean_name).strip()
-
-        # Detect series patterns (S01E01, etc.) and truncate. This is a very strong signal.
         series_pattern = r'\b(S\d{2,}|Season\s*\d+|E\d{2,})\b'
         match = re.search(series_pattern, clean_name, flags=re.IGNORECASE)
         if match:
             clean_name = clean_name[:match.start()]
 
-        # Extract year (4-digit number)
         year_match = re.search(r'(\d{4})', clean_name)
         year = None
         if year_match:
@@ -131,71 +122,48 @@ def parse_filename(filename):
                 year = str(found_year)
                 clean_name = re.sub(r'\b' + year + r'\b', '', clean_name)
 
-        # Remove a comprehensive list of known junk tags
         tags_to_remove = [
-            # Quality
             '1080p', '720p', '480p', '2160p', '4k', 'uhd', 'hd', 'fhd',
-            # Source
             'web-dl', 'dl', 'webrip', 'web', 'hdtv', 'hdrip', 'bluray', 'bdrip', 'dvdrip',
             'amzn', 'nf', 'dsnp', 'hbo',
-            # Codec
             'x264', 'x265', 'h264', 'h265', 'avc', 'hevc', '10bit',
-            # Audio
             'aac', 'ac3', 'dts', 'atmos', '5.1', '7.1', r'ddp\d\s\d',
-            # Language/Misc
             'dual audio', 'hindi', 'english', 'bengali', 'tamil', 'telugu', 'dubbed',
-            'esub', 'msub', 'combined',
-            # Common Release Groups (if not caught by hyphen rule)
-            'telly', 'psa', 'fmovies', 'yify', '-'
+            'esub', 'msub', 'combined', 'telly', 'psa', 'fmovies', 'yify', '-'
         ]
         
         for tag in tags_to_remove:
             clean_name = re.sub(r'\b' + tag + r'\b', '', clean_name, flags=re.IGNORECASE)
 
-        # Final cleanup of extra spaces
         title = re.sub(r'\s+', ' ', clean_name).strip()
         
-        if not title:
-            return None, None
-            
+        if not title: return None, None
         return title, year
-        
     except Exception as e:
         print(f"ERROR in parse_filename for '{filename}': {e}")
-        # Fallback to returning the filename without extension if all else fails
         return os.path.splitext(filename)[0].replace('.', ' ').replace('_', ' '), None
-
 
 def search_tmdb_for_bot(title, year):
     base_url = "https://api.themoviedb.org/3/search/multi"
     params = {"api_key": TMDB_API_KEY, "query": quote(title)}
-    
-    if year:
-        params["year"] = year
-    
+    if year: params["year"] = year
     search_url = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
-    
     try:
         response = requests.get(search_url, timeout=10)
         response.raise_for_status()
         results = response.json().get('results', [])
-        
         if not results and year:
-            print(f"No results for '{title}' with year {year}. Retrying without year.")
             params.pop("year")
             search_url_no_year = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
             response = requests.get(search_url_no_year, timeout=10)
             results = response.json().get('results', [])
-
         first_result = next((r for r in results if r.get('media_type') in ['movie', 'tv']), None)
         if not first_result: return None
-        
         media_type, tmdb_id = first_result['media_type'], first_result['id']
         detail_url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
         data = requests.get(detail_url, timeout=10).json()
         return {
-            "title": data.get("title") or data.get("name"),
-            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
+            "title": data.get("title") or data.get("name"), "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
             "backdrop": f"https://image.tmdb.org/t/p/w1280{data.get('backdrop_path')}" if data.get('backdrop_path') else None,
             "overview": data.get("overview"), "release_date": data.get("release_date") or data.get("first_air_date"),
             "genres": [g['name'] for g in data.get("genres", [])], "vote_average": data.get("vote_average"),
@@ -209,52 +177,46 @@ def handle_new_post(update):
     try:
         message = update.channel_post
         if not message or message.chat_id != TARGET_CHANNEL_ID: return
-        
         file = message.video or message.document
         if not file or not file.file_name: return
-        
         title, year = parse_filename(file.file_name)
         if not title:
-            bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Could not extract a valid movie title from the filename.", reply_to_message_id=message.message_id, parse_mode='Markdown')
+            bot.send_message(chat_id=message.chat_id, text="⚠️ **Error:** Could not extract a valid movie title.", reply_to_message_id=message.message_id, parse_mode='Markdown')
             return
-
         tmdb_details = search_tmdb_for_bot(title, year)
         if not tmdb_details:
             bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not find `{title}` on TMDB.", reply_to_message_id=message.message_id, parse_mode='Markdown')
             return
-        
         movie_data = {
             "title": tmdb_details["title"], "type": tmdb_details["type"], "poster": tmdb_details["poster"] or PLACEHOLDER_POSTER,
             "backdrop": tmdb_details["backdrop"], "overview": tmdb_details["overview"], "release_date": tmdb_details["release_date"],
             "genres": tmdb_details["genres"], "vote_average": tmdb_details["vote_average"], "created_at": datetime.utcnow(),
             "telegram_ref": {"chat_id": message.chat_id, "message_id": message.message_id}
         }
-        
-        try:
-            result = movies.insert_one(movie_data)
-            post_url = f"{WEBSITE_URL}/movie/{result.inserted_id}"
-            bot.send_message(chat_id=message.chat_id, text=f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", reply_to_message_id=message.message_id, disable_web_page_preview=True)
-        except Exception as e:
-            bot.send_message(chat_id=message.chat_id, text=f"⚠️ **Error:** Could not post to database. Details: {e}", reply_to_message_id=message.message_id)
+        result = movies.insert_one(movie_data)
+        post_url = f"{WEBSITE_URL}/movie/{result.inserted_id}"
+        bot.send_message(chat_id=message.chat_id, text=f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added.\n\n🔗 **View Post:** {post_url}", reply_to_message_id=message.message_id, disable_web_page_preview=True)
     except Exception as e:
         print(f"CRITICAL ERROR in handle_new_post: {e}")
 
 async def generate_fresh_link_async(chat_id, msg_id):
-    if not pyro_bot.is_initialized:
-        await pyro_bot.start()
-    try:
-        link = await pyro_bot.get_download_link(chat_id, msg_id)
-        return link
-    except Exception as e:
-        print(f"LINKGEN ERROR for {chat_id}/{msg_id}: {e}")
+    """Generates a link by initializing the client on-demand."""
+    print("Attempting to generate link...")
+    async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=PYROGRAM_SESSION) as user_bot:
         try:
-            print("Retrying link generation with forwarding method...")
-            forwarded_message = await pyro_bot.forward_messages(chat_id="me", from_chat_id=chat_id, message_ids=msg_id)
-            link = await forwarded_message.download(in_memory=True)
-            await forwarded_message.delete()
+            print(f"Client initialized. Getting message for chat:{chat_id}, msg:{msg_id}")
+            message = await user_bot.get_messages(chat_id, msg_id)
+            if not message.media:
+                print("Error: Message does not contain media.")
+                return None
+            link = await message.download(in_memory=True)
+            print("Link generated successfully.")
             return link
-        except Exception as e2:
-            print(f"LINKGEN FORWARD-RETRY FAILED for {chat_id}/{msg_id}: {e2}")
+        except Exception as e:
+            print("--- DETAILED LINK GENERATION ERROR ---")
+            print(f"Error of type {type(e).__name__}: {e}")
+            traceback.print_exc()
+            print("--- END OF DETAILED ERROR ---")
             return None
 
 # --- Custom Jinja Filter & Context Processor ---
