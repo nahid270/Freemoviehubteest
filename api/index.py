@@ -659,14 +659,14 @@ wait_page_html = """
     {{ ad_settings.ad_body_top | safe }}
     <div class="wait-container">
         <h1>Please Wait</h1>
-        <p>Your download link is being generated. You will be redirected automatically.</p>
-        <div class="timer">Please wait <span id="countdown">5</span> seconds...</div>
+        <p>Your link will be ready shortly. Please wait for the timer to finish.</p>
+        <div class="timer">Please wait <span id="countdown">{{ ad_settings.wait_time or 5 }}</span> seconds...</div>
         <a id="get-link-btn" class="get-link-btn" href="#">Generating Link...</a>
         {% if ad_settings.ad_wait_page %}<div class="ad-container">{{ ad_settings.ad_wait_page | safe }}</div>{% endif %}
     </div>
     <script>
         (function() {
-            let timeLeft = 5;
+            let timeLeft = {{ ad_settings.wait_time or 5 }};
             const countdownElement = document.getElementById('countdown');
             const linkButton = document.getElementById('get-link-btn');
             const targetUrl = "{{ target_url | safe }}";
@@ -677,7 +677,8 @@ wait_page_html = """
                     linkButton.classList.add('ready');
                     linkButton.textContent = 'Click Here to Proceed';
                     linkButton.href = targetUrl;
-                    window.location.href = targetUrl;
+                    // The automatic redirect is now removed. User must click the button.
+                    // window.location.href = targetUrl; 
                 } else {
                     countdownElement.textContent = timeLeft;
                 }
@@ -870,9 +871,15 @@ admin_html = """
     </div>
     <hr>
 
-    <h2><i class="fas fa-bullhorn"></i> Advertisement Management</h2>
+    <h2><i class="fas fa-bullhorn"></i> Advertisement & Settings</h2>
     <form method="post">
         <input type="hidden" name="form_action" value="update_ads">
+        <fieldset><legend>Wait Page Timer</legend>
+            <div class="form-group">
+                <label>Wait Time (in seconds):</label>
+                <input type="number" name="wait_time" value="{{ ad_settings.wait_time or 5 }}" min="0" required>
+            </div>
+        </fieldset>
         <fieldset><legend>Global Ad Codes</legend>
             <div class="form-group"><label>Header Script:</label><textarea name="ad_header" rows="4">{{ ad_settings.ad_header or '' }}</textarea></div>
             <div class="form-group"><label>Body Top Script:</label><textarea name="ad_body_top" rows="4">{{ ad_settings.ad_body_top or '' }}</textarea></div>
@@ -883,7 +890,7 @@ admin_html = """
              <div class="form-group"><label>Details Page Ad:</label><textarea name="ad_detail_page" rows="4">{{ ad_settings.ad_detail_page or '' }}</textarea></div>
              <div class="form-group"><label>Wait Page Ad:</label><textarea name="ad_wait_page" rows="4">{{ ad_settings.ad_wait_page or '' }}</textarea></div>
         </fieldset>
-        <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Ad Settings</button>
+        <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Settings</button>
     </form>
     <hr>
 
@@ -1148,11 +1155,19 @@ def wait_page():
 @app.route('/admin', methods=["GET", "POST"])
 @requires_auth
 def admin():
-    # POST request handling is unchanged
     if request.method == "POST":
         form_action = request.form.get("form_action")
         if form_action == "update_ads":
-            ad_settings_data = {"ad_header": request.form.get("ad_header"), "ad_body_top": request.form.get("ad_body_top"), "ad_footer": request.form.get("ad_footer"), "ad_list_page": request.form.get("ad_list_page"), "ad_detail_page": request.form.get("ad_detail_page"), "ad_wait_page": request.form.get("ad_wait_page")}
+            # *** MODIFIED: Added wait_time to the saved settings ***
+            ad_settings_data = {
+                "wait_time": request.form.get("wait_time", 5, type=int),
+                "ad_header": request.form.get("ad_header"), 
+                "ad_body_top": request.form.get("ad_body_top"), 
+                "ad_footer": request.form.get("ad_footer"), 
+                "ad_list_page": request.form.get("ad_list_page"), 
+                "ad_detail_page": request.form.get("ad_detail_page"), 
+                "ad_wait_page": request.form.get("ad_wait_page")
+            }
             settings.update_one({"_id": "ad_config"}, {"$set": ad_settings_data}, upsert=True)
         elif form_action == "add_category":
             category_name = request.form.get("category_name", "").strip()
