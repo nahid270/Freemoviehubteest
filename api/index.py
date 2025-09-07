@@ -1,30 +1,50 @@
+# =========================================================================================
+# === [START] INITIALIZATION AND IMPORTS ================================================
+# =========================================================================================
 import os
 import sys
 import requests
+import re
+import threading
+import math
 from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from functools import wraps
 from urllib.parse import unquote, quote
 from datetime import datetime, time
-import math # Added for pagination calculation
+from dotenv import load_dotenv
+from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- Environment Variables ---
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://mewayo8672:mewayo8672@cluster0.ozhvczp.mongodb.net/?retryWrites=true&w=majoritye=Cluster0")
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "7dc544d9253bccc3cfecc1c677f69819")
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Nahid")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "270")
-WEBSITE_NAME = os.environ.get("WEBSITE_NAME", "FreeMovieHub")
+MONGO_URI = os.environ.get("MONGO_URI")
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "password")
+WEBSITE_NAME = os.environ.get("WEBSITE_NAME", "MovieSite")
+WEBSITE_URL = os.environ.get("WEBSITE_URL", "http://127.0.0.1:5000")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID")
 
 # --- Validate Environment Variables ---
-if not all([MONGO_URI, TMDB_API_KEY, ADMIN_USERNAME, ADMIN_PASSWORD]):
-    print("FATAL: One or more required environment variables are missing.")
-    if os.environ.get('VERCEL') != '1':
-        sys.exit(1)
+if not all([MONGO_URI, TMDB_API_KEY]):
+    print("FATAL: MONGO_URI and TMDB_API_KEY must be set.")
+    sys.exit(1)
+if BOT_TOKEN and TARGET_CHANNEL_ID:
+    try:
+        TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID)
+    except (ValueError, TypeError):
+        print("WARNING: TARGET_CHANNEL_ID is invalid. Bot will not start.")
+        BOT_TOKEN = None
+else:
+    print("INFO: Telegram bot auto-posting is disabled (BOT_TOKEN or TARGET_CHANNEL_ID not set).")
 
 # --- App Initialization ---
 PLACEHOLDER_POSTER = "https://via.placeholder.com/400x600.png?text=Poster+Not+Found"
-ITEMS_PER_PAGE = 20 # New constant for pagination
+ITEMS_PER_PAGE = 20
 app = Flask(__name__)
 
 # --- Authentication ---
@@ -32,7 +52,7 @@ def check_auth(username, password):
     return username == ADMIN_USERNAME and password == ADMIN_PASSWORD
 
 def authenticate():
-    return Response('Could not verify your access level.', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'})
+    return Response('Could not verify access.', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'})
 
 def requires_auth(f):
     @wraps(f)
@@ -46,53 +66,153 @@ def requires_auth(f):
 # --- Database Connection ---
 try:
     client = MongoClient(MONGO_URI)
-    db = client["movie_db"]
+    db = client.get_default_database() if "retryWrites" in MONGO_URI else client["movie_db"]
     movies = db["movies"]
     settings = db["settings"]
     categories_collection = db["categories"]
-    requests_collection = db["requests"] # New collection for user requests
-    print("SUCCESS: Successfully connected to MongoDB!")
+    requests_collection = db["requests"]
+    print("SUCCESS: Connected to MongoDB!")
 
     if categories_collection.count_documents({}) == 0:
         default_categories = ["Coming Soon", "Bengali", "Hindi", "English", "18+ Adult Zone", "Trending"]
         categories_collection.insert_many([{"name": cat} for cat in default_categories])
-        print("SUCCESS: Initialized default categories in the database.")
+        print("SUCCESS: Initialized default categories.")
 
-    try:
-        movies.create_index("title")
-        movies.create_index("type")
-        movies.create_index("categories")
-        movies.create_index("created_at")
-        categories_collection.create_index("name", unique=True)
-        requests_collection.create_index("status")
-        requests_collection.create_index("created_at")
-        print("SUCCESS: MongoDB indexes checked/created.")
-    except Exception as e:
-        print(f"WARNING: Could not create MongoDB indexes: {e}")
+    for collection in [movies, categories_collection, requests_collection]:
+        try:
+            if collection == movies:
+                collection.create_index("title")
+                collection.create_index("type")
+                collection.create_index("categories")
+            elif collection == categories_collection:
+                collection.create_index("name", unique=True)
+            elif collection == requests_collection:
+                collection.create_index("status")
+        except Exception as e:
+            print(f"WARNING: Index creation failed for {collection.name}: {e}")
+    print("SUCCESS: MongoDB indexes checked/created.")
 
 except Exception as e:
-    print(f"FATAL: Error connecting to MongoDB: {e}.")
-    if os.environ.get('VERCEL') != '1':
-        sys.exit(1)
+    print(f"FATAL: Error connecting to MongoDB: {e}")
+    sys.exit(1)
 
-# --- Custom Jinja Filter for Relative Time ---
+# =========================================================================================
+# === [START] TELEGRAM BOT AUTOMATION LOGIC =============================================
+# =========================================================================================
+def parse_filename(filename):
+    match = re.search(r'^(.*?)\s*\((\d{4})\)', filename)
+    if match:
+        title = match.group(1).strip().replace('.', ' ').replace('_', ' ')
+        year = match.group(2)
+        return title, year
+    return None, None
+
+def search_tmdb_for_bot(title, year):
+    search_url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote(title)}&year={year}"
+    try:
+        response = requests.get(search_url, timeout=10)
+        response.raise_for_status()
+        results = response.json().get('results', [])
+        if not results: return None
+        
+        first_result = results[0]
+        media_type = first_result.get('media_type')
+        tmdb_id = first_result.get('id')
+        if not media_type or not tmdb_id or media_type not in ['movie', 'tv']: return None
+
+        detail_url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
+        detail_response = requests.get(detail_url, timeout=10)
+        detail_response.raise_for_status()
+        data = detail_response.json()
+        
+        return {
+            "title": data.get("title") or data.get("name"),
+            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
+            "backdrop": f"https://image.tmdb.org/t/p/w1280{data.get('backdrop_path')}" if data.get('backdrop_path') else None,
+            "overview": data.get("overview"),
+            "release_date": data.get("release_date") or data.get("first_air_date"),
+            "genres": [g['name'] for g in data.get("genres", [])],
+            "vote_average": data.get("vote_average"),
+            "type": "series" if media_type == "tv" else "movie"
+        }
+    except requests.RequestException as e:
+        print(f"BOT ERROR: TMDB API request failed: {e}")
+        return None
+
+def handle_new_post(update: object, context: CallbackContext):
+    message = update.channel_post
+    if message.chat_id != TARGET_CHANNEL_ID: return
+
+    file = message.video or message.document
+    if not file or not file.file_name: return
+        
+    print(f"BOT INFO: Received file: {file.file_name}")
+    title, year = parse_filename(file.file_name)
+    if not title:
+        message.reply_text(f"⚠️ **Error:** Filename `{file.file_name}` is not in the correct format.\nRequired format: `Movie Name (Year).mkv`", parse_mode='Markdown')
+        return
+
+    tmdb_details = search_tmdb_for_bot(title, year)
+    if not tmdb_details:
+        message.reply_text(f"⚠️ **Error:** Could not find `{title} ({year})` on TMDB.", parse_mode='Markdown')
+        return
+        
+    try:
+        tg_file = context.bot.get_file(file.file_id)
+        direct_download_link = tg_file.file_path
+        player_link = f"https://player.infuse.workers.dev/?link={direct_download_link}"
+    except Exception as e:
+        print(f"BOT ERROR: Failed to generate Telegram links: {e}")
+        message.reply_text(f"⚠️ **Error:** Could not generate Telegram links.")
+        return
+
+    movie_data = {
+        "title": tmdb_details["title"], "type": tmdb_details["type"], "poster": tmdb_details["poster"] or PLACEHOLDER_POSTER,
+        "backdrop": tmdb_details["backdrop"], "overview": tmdb_details["overview"], "language": None,
+        "genres": tmdb_details["genres"], "categories": [], "release_date": tmdb_details["release_date"],
+        "vote_average": tmdb_details["vote_average"], "created_at": datetime.utcnow(),
+        "links": [], "episodes": [], "season_packs": [],
+        "manual_links": [
+            {"name": "Watch Online", "url": player_link},
+            {"name": "Download Now", "url": direct_download_link}
+        ]
+    }
+    
+    try:
+        result = movies.insert_one(movie_data)
+        new_movie_id = result.inserted_id
+        print(f"BOT SUCCESS: Added '{tmdb_details['title']}' to database.")
+        
+        post_url = f"{WEBSITE_URL}/movie/{new_movie_id}"
+        reply_message = f"✅ **Post Successful!**\n\n**'{tmdb_details['title']}'** has been added to the website.\n\n🔗 **View Post:** {post_url}"
+        message.reply_text(reply_message)
+    except Exception as e:
+        print(f"BOT ERROR: Failed to insert document into MongoDB: {e}")
+        message.reply_text(f"⚠️ **Error:** Could not post to database. Details: {e}")
+
+def start_telegram_bot():
+    if BOT_TOKEN and TARGET_CHANNEL_ID:
+        updater = Updater(BOT_TOKEN)
+        dispatcher = updater.dispatcher
+        dispatcher.add_handler(MessageHandler(Filters.update.channel_posts & (Filters.video | Filters.document), handle_new_post, run_async=True))
+        
+        thread = threading.Thread(target=updater.start_polling)
+        thread.daemon = True
+        thread.start()
+        print("SUCCESS: Telegram bot is running in a separate thread.")
+
+# =========================================================================================
+# === [START] JINJA FILTERS & CONTEXT PROCESSORS ==========================================
+# =========================================================================================
 def time_ago(obj_id):
     if not isinstance(obj_id, ObjectId): return ""
     post_time = obj_id.generation_time.replace(tzinfo=None)
-    now = datetime.utcnow()
-    diff = now - post_time
-    seconds = diff.total_seconds()
-    
-    if seconds < 60: return "just now"
-    elif seconds < 3600:
-        minutes = int(seconds / 60)
-        return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
-    elif seconds < 86400:
-        hours = int(seconds / 3600)
-        return f"{hours} hour{'s' if hours > 1 else ''} ago"
-    else:
-        days = int(seconds / 86400)
-        return f"{days} day{'s' if days > 1 else ''} ago"
+    diff = datetime.utcnow() - post_time
+    s = diff.total_seconds()
+    if s < 60: return "just now"
+    if s < 3600: return f"{int(s/60)} minute{'s' if s/60 >= 2 else ''} ago"
+    if s < 86400: return f"{int(s/3600)} hour{'s' if s/3600 >= 2 else ''} ago"
+    return f"{int(s/86400)} day{'s' if s/86400 >= 2 else ''} ago"
 
 app.jinja_env.filters['time_ago'] = time_ago
 
@@ -110,6 +230,7 @@ def inject_globals():
 # =========================================================================================
 # === [START] HTML TEMPLATES ============================================================
 # =========================================================================================
+# (আপনার দেওয়া সকল HTML টেমপ্লেট এখানে থাকবে। আমি জায়গা বাঁচাতে এগুলোকে সংক্ষিপ্ত করছি)
 index_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -131,6 +252,17 @@ index_html = """
     --cyan-accent: #00FFFF; --yellow-accent: #FFFF00; --trending-color: #F83D61;
     --type-color: #00E599;
   }
+  @keyframes rgb-glow {
+    0%   { border-color: #ff00de; box-shadow: 0 0 5px #ff00de, 0 0 10px #ff00de inset; }
+    25%  { border-color: #00ffff; box-shadow: 0 0 7px #00ffff, 0 0 12px #00ffff inset; }
+    50%  { border-color: #00ff7f; box-shadow: 0 0 5px #00ff7f, 0 0 10px #00ff7f inset; }
+    75%  { border-color: #f83d61; box-shadow: 0 0 7px #f83d61, 0 0 12px #f83d61 inset; }
+    100% { border-color: #ff00de; box-shadow: 0 0 5px #ff00de, 0 0 10px #ff00de inset; }
+  }
+  @keyframes pulse-glow {
+    0%, 100% { color: var(--text-dark); text-shadow: none; }
+    50% { color: var(--text-light); text-shadow: 0 0 10px var(--cyan-accent); }
+  }
   html { box-sizing: border-box; } *, *:before, *:after { box-sizing: inherit; }
   body {font-family: 'Poppins', sans-serif;background-color: var(--bg-color);color: var(--text-light);overflow-x: hidden; padding-bottom: 70px;}
   a { text-decoration: none; color: inherit; } img { max-width: 100%; display: block; }
@@ -140,15 +272,6 @@ index_html = """
   .header-content { display: flex; justify-content: space-between; align-items: center; width: 100%; }
   .logo { font-size: 1.8rem; font-weight: 700; color: var(--primary-color); }
   .menu-toggle { display: block; font-size: 1.8rem; cursor: pointer; background: none; border: none; color: white; z-index: 1001;}
-  
-  /* Desktop Search & Nav (Hidden on Mobile) */
-  .desktop-nav, .desktop-search-container { display: none; }
-  .search-results-dropdown { display: none; position: absolute; top: 115%; right: 0; width: 350px; background-color: var(--card-bg); border: 1px solid #444; border-radius: 8px; max-height: 400px; overflow-y: auto; z-index: 1001; box-shadow: 0 5px 15px rgba(0,0,0,0.5); }
-  .search-results-dropdown.active { display: block; }
-  .search-results-dropdown .search-result-item { display: flex; align-items: center; padding: 8px; gap: 12px; }
-  .search-results-dropdown .search-result-item:hover { background-color: #333; }
-  .search-results-dropdown .search-result-item img { width: 45px; height: 65px; border-radius: 4px; flex-shrink: 0; object-fit: cover; }
-  .search-results-dropdown .search-result-item span { white-space: normal; font-size: 0.9rem; }
   
   @keyframes cyan-glow {
       0% { box-shadow: 0 0 15px 2px #00D1FF; } 50% { box-shadow: 0 0 25px 6px #00D1FF; } 100% { box-shadow: 0 0 15px 2px #00D1FF; }
@@ -167,9 +290,28 @@ index_html = """
   .hero-slider .swiper-pagination-bullet-active { background: var(--text-light); width: 24px; border-radius: 5px; opacity: 1; }
 
   .category-section { margin: 30px 0; }
-  .category-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-  .category-title { font-size: 1.5rem; font-weight: 600; }
-  .view-all-link { font-size: 0.8rem; color: var(--text-dark); font-weight: 500; }
+  .category-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .category-title {
+    font-size: 1.5rem;
+    font-weight: 600;
+    display: inline-block;
+    padding: 8px 20px;
+    background-color: rgba(26, 26, 26, 0.8);
+    border: 2px solid;
+    border-radius: 50px;
+    animation: rgb-glow 4s linear infinite;
+    backdrop-filter: blur(3px);
+  }
+  .view-all-link {
+    font-size: 0.9rem;
+    color: var(--text-dark);
+    font-weight: 500;
+    padding: 6px 15px;
+    border-radius: 20px;
+    background-color: #222;
+    transition: all 0.3s ease;
+    animation: pulse-glow 2.5s ease-in-out infinite;
+  }
   .category-grid, .full-page-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
   .movie-card { display: block; position: relative; border-radius: 8px; overflow: hidden; background-color: var(--card-bg); border: 2px solid; }
   .movie-card:nth-child(4n+1), .movie-card:nth-child(4n+4) { border-color: var(--yellow-accent); }
@@ -209,9 +351,8 @@ index_html = """
   .close-search-btn { position: absolute; top: 20px; right: 20px; font-size: 2.5rem; color: white; background: none; border: none; cursor: pointer; }
   #search-input-live { width: 100%; padding: 15px; font-size: 1.2rem; border-radius: 8px; border: 2px solid var(--primary-color); background: var(--card-bg); color: white; margin-top: 60px; }
   #search-results-live { margin-top: 20px; max-height: calc(100vh - 150px); overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 15px; }
-  #search-results-live .search-result-item { text-align: center; }
+  .search-result-item { color: white; text-align: center; }
   .search-result-item img { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 5px; margin-bottom: 5px; }
-
   .pagination { display: flex; justify-content: center; align-items: center; gap: 10px; margin: 30px 0; }
   .pagination a, .pagination span { padding: 8px 15px; border-radius: 5px; background-color: var(--card-bg); color: var(--text-dark); font-weight: 500; }
   .pagination a:hover { background-color: #333; }
@@ -225,14 +366,6 @@ index_html = """
     .category-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
     .full-page-grid { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
     .full-page-grid-container { padding: 120px 40px 20px; }
-    .menu-toggle { display: none; }
-    .header-content { display: flex; justify-content: space-between; align-items: center; gap: 20px;}
-    .desktop-nav { display: flex; gap: 25px; align-items: center; margin: 0 auto; }
-    .desktop-nav a { font-weight: 500; font-size: 0.95rem; transition: color 0.2s; }
-    .desktop-nav a:hover { color: var(--primary-color); }
-    .desktop-search-container { display: block; position: relative; }
-    #desktop-search-input { padding: 9px 18px; width: 250px; border-radius: 50px; border: 1px solid #333; background-color: var(--card-bg); color: white; transition: all 0.3s ease; }
-    #desktop-search-input:focus { outline: none; border-color: var(--primary-color); box-shadow: 0 0 0 2px rgba(229, 9, 20, 0.5); }
   }
 </style>
 </head>
@@ -241,16 +374,6 @@ index_html = """
 <header class="main-header">
     <div class="container header-content">
         <a href="{{ url_for('home') }}" class="logo">{{ website_name }}</a>
-        <nav class="desktop-nav">
-            <a href="{{ url_for('home') }}">Home</a>
-            <a href="{{ url_for('all_movies') }}">All Movies</a>
-            <a href="{{ url_for('all_series') }}">All Series</a>
-            <a href="{{ url_for('request_content') }}">Request</a>
-        </nav>
-        <div class="desktop-search-container">
-            <input type="text" id="desktop-search-input" placeholder="Search..." autocomplete="off">
-            <div id="desktop-search-results" class="search-results-dropdown"></div>
-        </div>
         <button class="menu-toggle"><i class="fas fa-bars"></i></button>
     </div>
 </header>
@@ -375,89 +498,30 @@ index_html = """
         closeBtn.addEventListener('click', () => { mobileMenu.classList.remove('active'); });
         document.querySelectorAll('.mobile-links a').forEach(link => { link.addEventListener('click', () => { mobileMenu.classList.remove('active'); }); });
     }
-
-    let debounceTimer;
-    function fetchAndRenderResults(query, resultsContainer) {
-        const isDesktop = resultsContainer.id === 'desktop-search-results';
-        const waitingText = `<p style="color: #555; text-align: center; padding: 15px;">${query.length > 1 ? 'Searching...' : 'Start typing to see results'}</p>`;
-        
-        if (query.length <= 1) {
-            resultsContainer.innerHTML = waitingText;
-            if(isDesktop) resultsContainer.classList.remove('active');
-            return;
-        }
-
-        resultsContainer.innerHTML = waitingText;
-        if(isDesktop) resultsContainer.classList.add('active');
-
-        fetch(`/api/search?q=${encodeURIComponent(query)}`)
-            .then(response => response.json())
-            .then(data => {
-                let html = '';
-                if (data.length > 0) {
-                    data.forEach(item => {
-                        const itemHtml = `
-                            <img src="${item.poster}" alt="${item.title}">
-                            <span>${item.title}</span>`;
-                        if (isDesktop) {
-                            html += `<a href="/movie/${item._id}" class="search-result-item">${itemHtml}</a>`;
-                        } else {
-                            html += `<a href="/movie/${item._id}" class="search-result-item">${itemHtml}</a>`;
-                        }
-                    });
-                } else {
-                    html = '<p style="color: #555; text-align: center; padding: 15px;">No results found.</p>';
-                }
-                resultsContainer.innerHTML = html;
-                if(isDesktop) resultsContainer.classList.add('active');
-            }).catch(err => {
-                 resultsContainer.innerHTML = '<p style="color: #900; text-align: center; padding: 15px;">Search failed.</p>';
-            });
-    }
-
-    // --- Mobile Search ---
     const liveSearchBtn = document.getElementById('live-search-btn');
     const searchOverlay = document.getElementById('search-overlay');
     const closeSearchBtn = document.getElementById('close-search-btn');
     const searchInputLive = document.getElementById('search-input-live');
     const searchResultsLive = document.getElementById('search-results-live');
-    
+    let debounceTimer;
     liveSearchBtn.addEventListener('click', () => { searchOverlay.classList.add('active'); searchInputLive.focus(); });
     closeSearchBtn.addEventListener('click', () => { searchOverlay.classList.remove('active'); });
     searchInputLive.addEventListener('input', () => {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
-            fetchAndRenderResults(searchInputLive.value.trim(), searchResultsLive);
+            const query = searchInputLive.value.trim();
+            if (query.length > 1) {
+                searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Searching...</p>';
+                fetch(`/api/search?q=${encodeURIComponent(query)}`).then(response => response.json()).then(data => {
+                    let html = '';
+                    if (data.length > 0) {
+                        data.forEach(item => { html += `<a href="/movie/${item._id}" class="search-result-item"><img src="${item.poster}" alt="${item.title}"><span>${item.title}</span></a>`; });
+                    } else { html = '<p style="color: #555; text-align: center;">No results found.</p>'; }
+                    searchResultsLive.innerHTML = html;
+                });
+            } else { searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Start typing to see results</p>'; }
         }, 300);
     });
-    
-    // --- Desktop Search ---
-    const desktopSearchInput = document.getElementById('desktop-search-input');
-    const desktopSearchResults = document.getElementById('desktop-search-results');
-    const desktopSearchContainer = document.querySelector('.desktop-search-container');
-
-    if (desktopSearchInput) {
-        desktopSearchInput.addEventListener('input', () => {
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                fetchAndRenderResults(desktopSearchInput.value.trim(), desktopSearchResults);
-            }, 300);
-        });
-
-        desktopSearchInput.addEventListener('focus', () => {
-             const query = desktopSearchInput.value.trim();
-             if (query.length > 1 && desktopSearchResults.innerHTML.trim() !== '') {
-                  desktopSearchResults.classList.add('active');
-             }
-        });
-
-        document.addEventListener('click', (event) => {
-            if (desktopSearchContainer && !desktopSearchContainer.contains(event.target)) {
-                desktopSearchResults.classList.remove('active');
-            }
-        });
-    }
-
     new Swiper('.hero-slider', {
         loop: true, autoplay: { delay: 5000, disableOnInteraction: false },
         pagination: { el: '.swiper-pagination', clickable: true },
@@ -746,14 +810,14 @@ wait_page_html = """
     {{ ad_settings.ad_body_top | safe }}
     <div class="wait-container">
         <h1>Please Wait</h1>
-        <p>Your link will be ready shortly. Please wait for the timer to finish.</p>
-        <div class="timer">Please wait <span id="countdown">{{ ad_settings.wait_time or 5 }}</span> seconds...</div>
+        <p>Your download link is being generated. You will be redirected automatically.</p>
+        <div class="timer">Please wait <span id="countdown">5</span> seconds...</div>
         <a id="get-link-btn" class="get-link-btn" href="#">Generating Link...</a>
         {% if ad_settings.ad_wait_page %}<div class="ad-container">{{ ad_settings.ad_wait_page | safe }}</div>{% endif %}
     </div>
     <script>
         (function() {
-            let timeLeft = {{ ad_settings.wait_time or 5 }};
+            let timeLeft = 5;
             const countdownElement = document.getElementById('countdown');
             const linkButton = document.getElementById('get-link-btn');
             const targetUrl = "{{ target_url | safe }}";
@@ -764,8 +828,7 @@ wait_page_html = """
                     linkButton.classList.add('ready');
                     linkButton.textContent = 'Click Here to Proceed';
                     linkButton.href = targetUrl;
-                    // The automatic redirect is now removed. User must click the button.
-                    // window.location.href = targetUrl; 
+                    window.location.href = targetUrl;
                 } else {
                     countdownElement.textContent = timeLeft;
                 }
@@ -958,15 +1021,9 @@ admin_html = """
     </div>
     <hr>
 
-    <h2><i class="fas fa-bullhorn"></i> Advertisement & Settings</h2>
+    <h2><i class="fas fa-bullhorn"></i> Advertisement Management</h2>
     <form method="post">
         <input type="hidden" name="form_action" value="update_ads">
-        <fieldset><legend>Wait Page Timer</legend>
-            <div class="form-group">
-                <label>Wait Time (in seconds):</label>
-                <input type="number" name="wait_time" value="{{ ad_settings.wait_time or 5 }}" min="0" required>
-            </div>
-        </fieldset>
         <fieldset><legend>Global Ad Codes</legend>
             <div class="form-group"><label>Header Script:</label><textarea name="ad_header" rows="4">{{ ad_settings.ad_header or '' }}</textarea></div>
             <div class="form-group"><label>Body Top Script:</label><textarea name="ad_body_top" rows="4">{{ ad_settings.ad_body_top or '' }}</textarea></div>
@@ -977,7 +1034,7 @@ admin_html = """
              <div class="form-group"><label>Details Page Ad:</label><textarea name="ad_detail_page" rows="4">{{ ad_settings.ad_detail_page or '' }}</textarea></div>
              <div class="form-group"><label>Wait Page Ad:</label><textarea name="ad_wait_page" rows="4">{{ ad_settings.ad_wait_page or '' }}</textarea></div>
         </fieldset>
-        <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Settings</button>
+        <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Ad Settings</button>
     </form>
     <hr>
 
@@ -1122,23 +1179,29 @@ edit_html = """
 </body></html>
 """
 
-# --- TMDB API Helper Function ---
+
+# =======================================================================================
+# === [START] HELPER FUNCTIONS & CLASSES ================================================
+# =======================================================================================
 def get_tmdb_details(tmdb_id, media_type):
-    # This function is unchanged
-    if not TMDB_API_KEY: return None
     search_type = "tv" if media_type == "tv" else "movie"
     try:
         detail_url = f"https://api.themoviedb.org/3/{search_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
         res = requests.get(detail_url, timeout=10)
         res.raise_for_status()
         data = res.json()
-        details = { "tmdb_id": tmdb_id, "title": data.get("title") or data.get("name"), "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None, "backdrop": f"https://image.tmdb.org/t/p/w1280{data.get('backdrop_path')}" if data.get('backdrop_path') else None, "overview": data.get("overview"), "release_date": data.get("release_date") or data.get("first_air_date"), "genres": [g['name'] for g in data.get("genres", [])], "vote_average": data.get("vote_average"), "type": "series" if search_type == "tv" else "movie" }
-        return details
+        return {
+            "tmdb_id": tmdb_id, "title": data.get("title") or data.get("name"),
+            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
+            "backdrop": f"https://image.tmdb.org/t/p/w1280{data.get('backdrop_path')}" if data.get('backdrop_path') else None,
+            "overview": data.get("overview"), "release_date": data.get("release_date") or data.get("first_air_date"),
+            "genres": [g['name'] for g in data.get("genres", [])], "vote_average": data.get("vote_average"),
+            "type": "series" if search_type == "tv" else "movie"
+        }
     except requests.RequestException as e:
         print(f"ERROR: TMDb API request failed: {e}")
         return None
 
-# --- Pagination Helper Class ---
 class Pagination:
     def __init__(self, page, per_page, total_count):
         self.page = page
@@ -1178,9 +1241,11 @@ def movie_detail(movie_id):
         movie = movies.find_one({"_id": ObjectId(movie_id)})
         if not movie: return "Content not found", 404
         related_content = []
-        if movie.get('type'): related_content = list(movies.find({"type": movie['type'], "_id": {"$ne": movie['_id']}}).sort('_id', -1).limit(10))
+        if movie.get('type'):
+            related_content = list(movies.find({"type": movie['type'], "_id": {"$ne": movie['_id']}}).sort('_id', -1).limit(10))
         return render_template_string(detail_html, movie=movie, related_content=related_content)
-    except: return "Content not found", 404
+    except:
+        return "Content not found", 404
 
 def get_paginated_content(query_filter, page):
     skip = (page - 1) * ITEMS_PER_PAGE
@@ -1207,12 +1272,9 @@ def movies_by_category():
     if not title: return redirect(url_for('home'))
     page = request.args.get('page', 1, type=int)
     
-    query_filter = {}
-    if title == "Latest": query_filter = {}
-    else: query_filter = {"categories": title}
-    
+    query_filter = {} if title == "Latest" else {"categories": title}
     content_list, pagination = get_paginated_content(query_filter, page)
-    query_title = "Latest Movies & Series" if title == "Latest" else title
+    query_title = "Latest Content" if title == "Latest" else title
     return render_template_string(index_html, movies=content_list, query=query_title, is_full_page_list=True, pagination=pagination)
 
 @app.route('/request', methods=['GET', 'POST'])
@@ -1222,13 +1284,9 @@ def request_content():
         extra_info = request.form.get('extra_info', '').strip()
         if content_name:
             requests_collection.insert_one({
-                "name": content_name,
-                "info": extra_info,
-                "status": "Pending",
-                "created_at": datetime.utcnow()
+                "name": content_name, "info": extra_info,
+                "status": "Pending", "created_at": datetime.utcnow()
             })
-            # This requires SECRET_KEY to be set for flash messages
-            # flash('Your request has been submitted successfully!', 'success')
         return redirect(url_for('request_content'))
     return render_template_string(request_html)
 
@@ -1245,41 +1303,40 @@ def admin():
     if request.method == "POST":
         form_action = request.form.get("form_action")
         if form_action == "update_ads":
-            # *** MODIFIED: Added wait_time to the saved settings ***
-            ad_settings_data = {
-                "wait_time": request.form.get("wait_time", 5, type=int),
-                "ad_header": request.form.get("ad_header"), 
-                "ad_body_top": request.form.get("ad_body_top"), 
-                "ad_footer": request.form.get("ad_footer"), 
-                "ad_list_page": request.form.get("ad_list_page"), 
-                "ad_detail_page": request.form.get("ad_detail_page"), 
-                "ad_wait_page": request.form.get("ad_wait_page")
-            }
-            settings.update_one({"_id": "ad_config"}, {"$set": ad_settings_data}, upsert=True)
+            ad_data = {f: request.form.get(f) for f in ["ad_header", "ad_body_top", "ad_footer", "ad_list_page", "ad_detail_page", "ad_wait_page"]}
+            settings.update_one({"_id": "ad_config"}, {"$set": ad_data}, upsert=True)
         elif form_action == "add_category":
             category_name = request.form.get("category_name", "").strip()
             if category_name: categories_collection.update_one({"name": category_name}, {"$set": {"name": category_name}}, upsert=True)
         elif form_action == "bulk_delete":
-            ids_to_delete = request.form.getlist("selected_ids")
-            if ids_to_delete: movies.delete_many({"_id": {"$in": [ObjectId(id_str) for id_str in ids_to_delete]}})
+            ids_to_delete = [ObjectId(id_str) for id_str in request.form.getlist("selected_ids")]
+            if ids_to_delete: movies.delete_many({"_id": {"$in": ids_to_delete}})
         elif form_action == "add_content":
             content_type = request.form.get("content_type", "movie")
-            movie_data = { "title": request.form.get("title").strip(), "type": content_type, "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER, "backdrop": request.form.get("backdrop").strip() or None, "overview": request.form.get("overview").strip(), "language": request.form.get("language").strip() or None, "genres": [g.strip() for g in request.form.get("genres", "").split(',') if g.strip()], "categories": request.form.getlist("categories"), "episodes": [], "links": [], "season_packs": [], "manual_links": [], "created_at": datetime.utcnow() }
-            tmdb_id = request.form.get("tmdb_id");
+            movie_data = {
+                "title": request.form.get("title").strip(), "type": content_type,
+                "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER,
+                "backdrop": request.form.get("backdrop").strip() or None,
+                "overview": request.form.get("overview").strip(),
+                "language": request.form.get("language").strip() or None,
+                "genres": [g.strip() for g in request.form.get("genres", "").split(',') if g.strip()],
+                "categories": request.form.getlist("categories"),
+                "created_at": datetime.utcnow()
+            }
+            tmdb_id = request.form.get("tmdb_id")
             if tmdb_id:
                 tmdb_details = get_tmdb_details(tmdb_id, "tv" if content_type == "series" else "movie")
-                if tmdb_details: movie_data.update({'release_date': tmdb_details.get('release_date'),'vote_average': tmdb_details.get('vote_average')})
+                if tmdb_details: movie_data.update({'release_date': tmdb_details.get('release_date'), 'vote_average': tmdb_details.get('vote_average')})
+            
+            # Links processing
             if content_type == "movie":
-                movie_links = []
-                for q in ["480p", "720p", "1080p"]:
-                    w, d = request.form.get(f"watch_link_{q}"), request.form.get(f"download_link_{q}")
-                    if w or d: movie_links.append({"quality": q, "watch_url": w, "download_url": d})
-                movie_data["links"] = movie_links
+                movie_data["links"] = [{"quality": q, "watch_url": request.form.get(f"watch_link_{q}"), "download_url": request.form.get(f"download_link_{q}")} for q in ["480p", "720p", "1080p"] if request.form.get(f"watch_link_{q}") or request.form.get(f"download_link_{q}")]
             else:
                 sp_nums, sp_w, sp_d = request.form.getlist('season_pack_number[]'), request.form.getlist('season_pack_watch_link[]'), request.form.getlist('season_pack_download_link[]')
                 movie_data['season_packs'] = [{"season_number": int(sp_nums[i]), "watch_link": sp_w[i].strip() or None, "download_link": sp_d[i].strip() or None} for i in range(len(sp_nums)) if sp_nums[i]]
                 s, n, t, l = request.form.getlist('episode_season[]'), request.form.getlist('episode_number[]'), request.form.getlist('episode_title[]'), request.form.getlist('episode_watch_link[]')
                 movie_data['episodes'] = [{"season": int(s[i]), "episode_number": int(n[i]), "title": t[i].strip(), "watch_link": l[i].strip()} for i in range(len(s)) if s[i] and n[i] and l[i]]
+
             names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
             movie_data["manual_links"] = [{"name": names[i].strip(), "url": urls[i].strip()} for i in range(len(names)) if names[i] and urls[i]]
             movies.insert_one(movie_data)
@@ -1290,17 +1347,17 @@ def admin():
     content_list = list(movies.find(query_filter).sort('_id', -1))
     
     stats = {
-        "total_content": movies.count_documents({}),
-        "total_movies": movies.count_documents({"type": "movie"}),
-        "total_series": movies.count_documents({"type": "series"}),
-        "pending_requests": requests_collection.count_documents({"status": "Pending"})
+        "total_content": movies.count_documents({}), "total_movies": movies.count_documents({"type": "movie"}),
+        "total_series": movies.count_documents({"type": "series"}), "pending_requests": requests_collection.count_documents({"status": "Pending"})
     }
     
-    requests_list = list(requests_collection.find().sort("created_at", -1))
-    categories_list = list(categories_collection.find().sort("name", 1))
-    ad_settings_data = settings.find_one({"_id": "ad_config"}) or {}
-    
-    return render_template_string(admin_html, content_list=content_list, stats=stats, requests_list=requests_list, ad_settings=ad_settings_data, categories_list=categories_list)
+    context = {
+        "content_list": content_list, "stats": stats,
+        "requests_list": list(requests_collection.find().sort("created_at", -1)),
+        "categories_list": list(categories_collection.find().sort("name", 1)),
+        "ad_settings": settings.find_one({"_id": "ad_config"}) or {}
+    }
+    return render_template_string(admin_html, **context)
 
 @app.route('/admin/category/delete/<cat_id>')
 @requires_auth
@@ -1333,17 +1390,18 @@ def edit_movie(movie_id):
     if not movie_obj: return "Movie not found", 404
     
     if request.method == "POST":
-        # POST logic is unchanged
         content_type = request.form.get("content_type")
-        update_data = { "title": request.form.get("title").strip(), "type": content_type, "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER, "backdrop": request.form.get("backdrop").strip() or None, "overview": request.form.get("overview").strip(), "language": request.form.get("language").strip() or None, "genres": [g.strip() for g in request.form.get("genres").split(',') if g.strip()], "categories": request.form.getlist("categories") }
+        update_data = {
+            "title": request.form.get("title").strip(), "type": content_type, "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER,
+            "backdrop": request.form.get("backdrop").strip() or None, "overview": request.form.get("overview").strip(),
+            "language": request.form.get("language").strip() or None, "genres": [g.strip() for g in request.form.get("genres").split(',') if g.strip()],
+            "categories": request.form.getlist("categories")
+        }
         names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
         update_data["manual_links"] = [{"name": names[i].strip(), "url": urls[i].strip()} for i in range(len(names)) if names[i] and urls[i]]
+        
         if content_type == "movie":
-            movie_links = []
-            for q in ["480p", "720p", "1080p"]:
-                w, d = request.form.get(f"watch_link_{q}"), request.form.get(f"download_link_{q}")
-                if w or d: movie_links.append({"quality": q, "watch_url": w, "download_url": d})
-            update_data["links"] = movie_links
+            update_data["links"] = [{"quality": q, "watch_url": request.form.get(f"watch_link_{q}"), "download_url": request.form.get(f"download_link_{q}")} for q in ["480p", "720p", "1080p"] if request.form.get(f"watch_link_{q}") or request.form.get(f"download_link_{q}")]
             movies.update_one({"_id": obj_id}, {"$set": update_data, "$unset": {"episodes": "", "season_packs": ""}})
         else:
             sp_nums, sp_w, sp_d = request.form.getlist('season_pack_number[]'), request.form.getlist('season_pack_watch_link[]'), request.form.getlist('season_pack_download_link[]')
@@ -1367,7 +1425,6 @@ def delete_movie(movie_id):
 @app.route('/admin/api/search')
 @requires_auth
 def api_search_tmdb():
-    # This API is unchanged
     query = request.args.get('query')
     if not query: return jsonify({"error": "Query parameter is missing"}), 400
     try:
@@ -1375,26 +1432,26 @@ def api_search_tmdb():
         res = requests.get(search_url, timeout=10)
         res.raise_for_status()
         data = res.json()
-        results = []
-        for item in data.get('results', []):
-            if item.get('media_type') in ['movie', 'tv'] and item.get('poster_path'):
-                results.append({"id": item.get('id'),"title": item.get('title') or item.get('name'),"year": (item.get('release_date') or item.get('first_air_date', 'N/A')).split('-')[0],"poster": f"https://image.tmdb.org/t/p/w200{item.get('poster_path')}","media_type": item.get('media_type')})
+        results = [
+            {"id": item.get('id'), "title": item.get('title') or item.get('name'),
+             "year": (item.get('release_date') or item.get('first_air_date', 'N/A')).split('-')[0],
+             "poster": f"https://image.tmdb.org/t/p/w200{item.get('poster_path')}",
+             "media_type": item.get('media_type')}
+            for item in data.get('results', []) if item.get('media_type') in ['movie', 'tv'] and item.get('poster_path')
+        ]
         return jsonify(results)
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route('/admin/api/details')
 @requires_auth
 def api_get_details():
-    # This API is unchanged
     tmdb_id, media_type = request.args.get('id'), request.args.get('type')
     if not tmdb_id or not media_type: return jsonify({"error": "ID and type are required"}), 400
     details = get_tmdb_details(tmdb_id, media_type)
-    if details: return jsonify(details)
-    else: return jsonify({"error": "Details not found on TMDb"}), 404
+    return jsonify(details) if details else (jsonify({"error": "Details not found"}), 404)
 
 @app.route('/api/search')
 def api_search():
-    # This API is unchanged
     query = request.args.get('q', '').strip()
     if not query: return jsonify([])
     try:
@@ -1405,5 +1462,10 @@ def api_search():
         print(f"API Search Error: {e}")
         return jsonify({"error": "An error occurred"}), 500
 
+# =======================================================================================
+# === [START] MAIN EXECUTION BLOCK ======================================================
+# =======================================================================================
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 3000)))
+    start_telegram_bot()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
