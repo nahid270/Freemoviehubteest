@@ -1,9 +1,9 @@
-Flask
-python-dotenv
+# requirements.txt
+flask
 requests
 pymongo
-dnspython
-python-telegram-bot==13.15  # একটি স্থিতিশীল ভার্সন ব্যবহার করুন
+python-dotenv
+python-telegram-bot
 pyrogram
 tgcrypto
-urllib3<2.0                # urllib3 এর ভার্সন ২.০ এর নিচে রাখুন
+aiohttp==3.9.1
