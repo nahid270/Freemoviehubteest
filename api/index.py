@@ -141,6 +141,15 @@ index_html = """
   .logo { font-size: 1.8rem; font-weight: 700; color: var(--primary-color); }
   .menu-toggle { display: block; font-size: 1.8rem; cursor: pointer; background: none; border: none; color: white; z-index: 1001;}
   
+  /* Desktop Search & Nav (Hidden on Mobile) */
+  .desktop-nav, .desktop-search-container { display: none; }
+  .search-results-dropdown { display: none; position: absolute; top: 115%; right: 0; width: 350px; background-color: var(--card-bg); border: 1px solid #444; border-radius: 8px; max-height: 400px; overflow-y: auto; z-index: 1001; box-shadow: 0 5px 15px rgba(0,0,0,0.5); }
+  .search-results-dropdown.active { display: block; }
+  .search-results-dropdown .search-result-item { display: flex; align-items: center; padding: 8px; gap: 12px; }
+  .search-results-dropdown .search-result-item:hover { background-color: #333; }
+  .search-results-dropdown .search-result-item img { width: 45px; height: 65px; border-radius: 4px; flex-shrink: 0; object-fit: cover; }
+  .search-results-dropdown .search-result-item span { white-space: normal; font-size: 0.9rem; }
+  
   @keyframes cyan-glow {
       0% { box-shadow: 0 0 15px 2px #00D1FF; } 50% { box-shadow: 0 0 25px 6px #00D1FF; } 100% { box-shadow: 0 0 15px 2px #00D1FF; }
   }
@@ -200,8 +209,9 @@ index_html = """
   .close-search-btn { position: absolute; top: 20px; right: 20px; font-size: 2.5rem; color: white; background: none; border: none; cursor: pointer; }
   #search-input-live { width: 100%; padding: 15px; font-size: 1.2rem; border-radius: 8px; border: 2px solid var(--primary-color); background: var(--card-bg); color: white; margin-top: 60px; }
   #search-results-live { margin-top: 20px; max-height: calc(100vh - 150px); overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 15px; }
-  .search-result-item { color: white; text-align: center; }
+  #search-results-live .search-result-item { text-align: center; }
   .search-result-item img { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 5px; margin-bottom: 5px; }
+
   .pagination { display: flex; justify-content: center; align-items: center; gap: 10px; margin: 30px 0; }
   .pagination a, .pagination span { padding: 8px 15px; border-radius: 5px; background-color: var(--card-bg); color: var(--text-dark); font-weight: 500; }
   .pagination a:hover { background-color: #333; }
@@ -215,6 +225,14 @@ index_html = """
     .category-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
     .full-page-grid { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
     .full-page-grid-container { padding: 120px 40px 20px; }
+    .menu-toggle { display: none; }
+    .header-content { display: flex; justify-content: space-between; align-items: center; gap: 20px;}
+    .desktop-nav { display: flex; gap: 25px; align-items: center; margin: 0 auto; }
+    .desktop-nav a { font-weight: 500; font-size: 0.95rem; transition: color 0.2s; }
+    .desktop-nav a:hover { color: var(--primary-color); }
+    .desktop-search-container { display: block; position: relative; }
+    #desktop-search-input { padding: 9px 18px; width: 250px; border-radius: 50px; border: 1px solid #333; background-color: var(--card-bg); color: white; transition: all 0.3s ease; }
+    #desktop-search-input:focus { outline: none; border-color: var(--primary-color); box-shadow: 0 0 0 2px rgba(229, 9, 20, 0.5); }
   }
 </style>
 </head>
@@ -223,6 +241,16 @@ index_html = """
 <header class="main-header">
     <div class="container header-content">
         <a href="{{ url_for('home') }}" class="logo">{{ website_name }}</a>
+        <nav class="desktop-nav">
+            <a href="{{ url_for('home') }}">Home</a>
+            <a href="{{ url_for('all_movies') }}">All Movies</a>
+            <a href="{{ url_for('all_series') }}">All Series</a>
+            <a href="{{ url_for('request_content') }}">Request</a>
+        </nav>
+        <div class="desktop-search-container">
+            <input type="text" id="desktop-search-input" placeholder="Search..." autocomplete="off">
+            <div id="desktop-search-results" class="search-results-dropdown"></div>
+        </div>
         <button class="menu-toggle"><i class="fas fa-bars"></i></button>
     </div>
 </header>
@@ -347,30 +375,89 @@ index_html = """
         closeBtn.addEventListener('click', () => { mobileMenu.classList.remove('active'); });
         document.querySelectorAll('.mobile-links a').forEach(link => { link.addEventListener('click', () => { mobileMenu.classList.remove('active'); }); });
     }
+
+    let debounceTimer;
+    function fetchAndRenderResults(query, resultsContainer) {
+        const isDesktop = resultsContainer.id === 'desktop-search-results';
+        const waitingText = `<p style="color: #555; text-align: center; padding: 15px;">${query.length > 1 ? 'Searching...' : 'Start typing to see results'}</p>`;
+        
+        if (query.length <= 1) {
+            resultsContainer.innerHTML = waitingText;
+            if(isDesktop) resultsContainer.classList.remove('active');
+            return;
+        }
+
+        resultsContainer.innerHTML = waitingText;
+        if(isDesktop) resultsContainer.classList.add('active');
+
+        fetch(`/api/search?q=${encodeURIComponent(query)}`)
+            .then(response => response.json())
+            .then(data => {
+                let html = '';
+                if (data.length > 0) {
+                    data.forEach(item => {
+                        const itemHtml = `
+                            <img src="${item.poster}" alt="${item.title}">
+                            <span>${item.title}</span>`;
+                        if (isDesktop) {
+                            html += `<a href="/movie/${item._id}" class="search-result-item">${itemHtml}</a>`;
+                        } else {
+                            html += `<a href="/movie/${item._id}" class="search-result-item">${itemHtml}</a>`;
+                        }
+                    });
+                } else {
+                    html = '<p style="color: #555; text-align: center; padding: 15px;">No results found.</p>';
+                }
+                resultsContainer.innerHTML = html;
+                if(isDesktop) resultsContainer.classList.add('active');
+            }).catch(err => {
+                 resultsContainer.innerHTML = '<p style="color: #900; text-align: center; padding: 15px;">Search failed.</p>';
+            });
+    }
+
+    // --- Mobile Search ---
     const liveSearchBtn = document.getElementById('live-search-btn');
     const searchOverlay = document.getElementById('search-overlay');
     const closeSearchBtn = document.getElementById('close-search-btn');
     const searchInputLive = document.getElementById('search-input-live');
     const searchResultsLive = document.getElementById('search-results-live');
-    let debounceTimer;
+    
     liveSearchBtn.addEventListener('click', () => { searchOverlay.classList.add('active'); searchInputLive.focus(); });
     closeSearchBtn.addEventListener('click', () => { searchOverlay.classList.remove('active'); });
     searchInputLive.addEventListener('input', () => {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
-            const query = searchInputLive.value.trim();
-            if (query.length > 1) {
-                searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Searching...</p>';
-                fetch(`/api/search?q=${encodeURIComponent(query)}`).then(response => response.json()).then(data => {
-                    let html = '';
-                    if (data.length > 0) {
-                        data.forEach(item => { html += `<a href="/movie/${item._id}" class="search-result-item"><img src="${item.poster}" alt="${item.title}"><span>${item.title}</span></a>`; });
-                    } else { html = '<p style="color: #555; text-align: center;">No results found.</p>'; }
-                    searchResultsLive.innerHTML = html;
-                });
-            } else { searchResultsLive.innerHTML = '<p style="color: #555; text-align: center;">Start typing to see results</p>'; }
+            fetchAndRenderResults(searchInputLive.value.trim(), searchResultsLive);
         }, 300);
     });
+    
+    // --- Desktop Search ---
+    const desktopSearchInput = document.getElementById('desktop-search-input');
+    const desktopSearchResults = document.getElementById('desktop-search-results');
+    const desktopSearchContainer = document.querySelector('.desktop-search-container');
+
+    if (desktopSearchInput) {
+        desktopSearchInput.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                fetchAndRenderResults(desktopSearchInput.value.trim(), desktopSearchResults);
+            }, 300);
+        });
+
+        desktopSearchInput.addEventListener('focus', () => {
+             const query = desktopSearchInput.value.trim();
+             if (query.length > 1 && desktopSearchResults.innerHTML.trim() !== '') {
+                  desktopSearchResults.classList.add('active');
+             }
+        });
+
+        document.addEventListener('click', (event) => {
+            if (desktopSearchContainer && !desktopSearchContainer.contains(event.target)) {
+                desktopSearchResults.classList.remove('active');
+            }
+        });
+    }
+
     new Swiper('.hero-slider', {
         loop: true, autoplay: { delay: 5000, disableOnInteraction: false },
         pagination: { el: '.swiper-pagination', clickable: true },
