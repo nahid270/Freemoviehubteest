@@ -99,17 +99,30 @@ except Exception as e:
     sys.exit(1)
 
 # =========================================================================================
-# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC (WITH SMART PARSING) ===============
+# === TELEGRAM BOT & REAL-TIME LINK GENERATION LOGIC (WITH IMPROVED SERIES PARSING) ======
 # =========================================================================================
 def parse_filename(filename):
     """
-    Cleans and parses a filename to extract the movie title and year more flexibly.
-    Includes error handling to prevent crashes.
+    Cleans and parses a filename to extract title and year,
+    with improved handling for series names (like S01E01).
     """
     try:
         clean_name = os.path.splitext(filename)[0]
+        
+        # Replace common delimiters with spaces
         clean_name = re.sub(r'[\._\-\[]', ' ', clean_name)
         
+        # --- Series Pattern Recognition ---
+        # Detect patterns like S01E01, Season 1, S01 etc., and remove them for a cleaner title search
+        series_pattern = r'\b(S\d+|Season\s*\d+|E\d+)\b'
+        # Find the first occurrence of a series pattern
+        match = re.search(series_pattern, clean_name, flags=re.IGNORECASE)
+        if match:
+            # If a series pattern is found, truncate the string from that point
+            # This helps remove all subsequent episode/quality tags
+            clean_name = clean_name[:match.start()]
+
+        # --- Year Recognition ---
         year_match = re.search(r'[\(\[]?(\d{4})[\)\]]?', clean_name)
         year = None
         if year_match:
@@ -117,37 +130,43 @@ def parse_filename(filename):
             current_year = datetime.now().year
             if 1900 <= found_year <= current_year + 2:
                 year = str(found_year)
+                # Remove year from title for cleaner search
                 clean_name = clean_name.replace(year_match.group(0), '')
 
+        # --- Tag Removal ---
         tags_to_remove = [
             '1080p', '720p', '480p', '2160p', '4k', 'uhd', 'hd', 'fhd',
             'web-dl', 'webrip', 'web', 'hdtv', 'hdrip', 'bluray', 'bdrip', 'dvdrip',
-            'x264', 'x265', 'h264', 'h265', 'avc', 'hevc',
+            'x264', 'x265', 'h264', 'h265', 'avc', 'hevc', '10bit',
             'aac', 'ac3', 'dts', 'atmos', '5.1', '7.1',
             'dual audio', 'hindi', 'english', 'bengali', 'tamil', 'telugu', 'dubbed',
-            'esub', 'msub',
+            'esub', 'msub', 'combined', 'now', 'x2'
         ]
         
+        # Remove content in brackets that often contains channel names or junk
         clean_name = re.sub(r'\[.*?\]', '', clean_name)
         
         for tag in tags_to_remove:
             clean_name = re.sub(r'\b' + tag + r'\b', '', clean_name, flags=re.IGNORECASE)
 
+        # Final cleanup
         title = re.sub(r'\s+', ' ', clean_name).strip()
         
         if not title:
             return None, None
             
         return title, year
+        
     except Exception as e:
         print(f"ERROR in parse_filename for '{filename}': {e}")
-        # Fallback to the original simple parser
+        # Fallback to the original simple parser if smart parsing fails
         match = re.search(r'^(.*?)\s*\((\d{4})\)', filename)
         if match:
             title = match.group(1).strip().replace('.', ' ').replace('_', ' ')
             year = match.group(2)
             return title, year
-        return None, None
+        # As a last resort, return the filename without extension and no year
+        return os.path.splitext(filename)[0].replace('.', ' ').replace('_', ' '), None
 
 
 def search_tmdb_for_bot(title, year):
