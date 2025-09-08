@@ -1,7 +1,7 @@
 import os
 import sys
 import requests
-from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify, flash
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from functools import wraps
@@ -15,6 +15,9 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "7dc544d9253bccc3cfecc1c677f69819"
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Nahid")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "270")
 WEBSITE_NAME = os.environ.get("WEBSITE_NAME", "FreeMovieHub")
+# It's good practice to set a secret key for flash messages
+SECRET_KEY = os.environ.get("SECRET_KEY", "a_very_secret_key_for_flash_messages")
+
 
 # --- Validate Environment Variables ---
 if not all([MONGO_URI, TMDB_API_KEY, ADMIN_USERNAME, ADMIN_PASSWORD]):
@@ -26,6 +29,7 @@ if not all([MONGO_URI, TMDB_API_KEY, ADMIN_USERNAME, ADMIN_PASSWORD]):
 PLACEHOLDER_POSTER = "https://via.placeholder.com/400x600.png?text=Poster+Not+Found"
 ITEMS_PER_PAGE = 20 # New constant for pagination
 app = Flask(__name__)
+app.secret_key = SECRET_KEY # Secret key is required for flash messaging
 
 # --- Authentication ---
 def check_auth(username, password):
@@ -756,7 +760,7 @@ wait_page_html = """
             let timeLeft = {{ ad_settings.wait_time or 5 }};
             const countdownElement = document.getElementById('countdown');
             const linkButton = document.getElementById('get-link-btn');
-            const targetUrl = "{{ target_url | safe }}";
+            const targetUrl = {{ target_url | tojson | safe }};
             const timer = setInterval(() => {
                 if (timeLeft <= 0) {
                     clearInterval(timer);
@@ -1124,7 +1128,6 @@ edit_html = """
 
 # --- TMDB API Helper Function ---
 def get_tmdb_details(tmdb_id, media_type):
-    # This function is unchanged
     if not TMDB_API_KEY: return None
     search_type = "tv" if media_type == "tv" else "movie"
     try:
@@ -1201,18 +1204,17 @@ def all_series():
     all_series_content, pagination = get_paginated_content({"type": "series"}, page)
     return render_template_string(index_html, movies=all_series_content, query="All Series", is_full_page_list=True, pagination=pagination)
 
-@app.route('/category')
-def movies_by_category():
-    title = request.args.get('name')
-    if not title: return redirect(url_for('home'))
+@app.route('/category/<name>')
+def movies_by_category(name):
+    if not name: return redirect(url_for('home'))
     page = request.args.get('page', 1, type=int)
     
     query_filter = {}
-    if title == "Latest": query_filter = {}
-    else: query_filter = {"categories": title}
+    if name == "Latest": query_filter = {}
+    else: query_filter = {"categories": name}
     
     content_list, pagination = get_paginated_content(query_filter, page)
-    query_title = "Latest Movies & Series" if title == "Latest" else title
+    query_title = "Latest Movies & Series" if name == "Latest" else name
     return render_template_string(index_html, movies=content_list, query=query_title, is_full_page_list=True, pagination=pagination)
 
 @app.route('/request', methods=['GET', 'POST'])
@@ -1227,8 +1229,9 @@ def request_content():
                 "status": "Pending",
                 "created_at": datetime.utcnow()
             })
-            # This requires SECRET_KEY to be set for flash messages
-            # flash('Your request has been submitted successfully!', 'success')
+            flash('Your request has been submitted successfully!', 'success')
+        else:
+            flash('Content name is required.', 'error')
         return redirect(url_for('request_content'))
     return render_template_string(request_html)
 
@@ -1245,7 +1248,6 @@ def admin():
     if request.method == "POST":
         form_action = request.form.get("form_action")
         if form_action == "update_ads":
-            # *** MODIFIED: Added wait_time to the saved settings ***
             ad_settings_data = {
                 "wait_time": request.form.get("wait_time", 5, type=int),
                 "ad_header": request.form.get("ad_header"), 
@@ -1333,7 +1335,6 @@ def edit_movie(movie_id):
     if not movie_obj: return "Movie not found", 404
     
     if request.method == "POST":
-        # POST logic is unchanged
         content_type = request.form.get("content_type")
         update_data = { "title": request.form.get("title").strip(), "type": content_type, "poster": request.form.get("poster").strip() or PLACEHOLDER_POSTER, "backdrop": request.form.get("backdrop").strip() or None, "overview": request.form.get("overview").strip(), "language": request.form.get("language").strip() or None, "genres": [g.strip() for g in request.form.get("genres").split(',') if g.strip()], "categories": request.form.getlist("categories") }
         names, urls = request.form.getlist('manual_link_name[]'), request.form.getlist('manual_link_url[]')
@@ -1367,7 +1368,6 @@ def delete_movie(movie_id):
 @app.route('/admin/api/search')
 @requires_auth
 def api_search_tmdb():
-    # This API is unchanged
     query = request.args.get('query')
     if not query: return jsonify({"error": "Query parameter is missing"}), 400
     try:
@@ -1385,7 +1385,6 @@ def api_search_tmdb():
 @app.route('/admin/api/details')
 @requires_auth
 def api_get_details():
-    # This API is unchanged
     tmdb_id, media_type = request.args.get('id'), request.args.get('type')
     if not tmdb_id or not media_type: return jsonify({"error": "ID and type are required"}), 400
     details = get_tmdb_details(tmdb_id, media_type)
@@ -1394,7 +1393,6 @@ def api_get_details():
 
 @app.route('/api/search')
 def api_search():
-    # This API is unchanged
     query = request.args.get('q', '').strip()
     if not query: return jsonify([])
     try:
